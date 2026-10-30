@@ -1,0 +1,6 @@
+{
+  "train_split": "VisDrone2019-DET-train",
+  "val_split": "VisDrone2019-DET-val",
+  "holdout_fraction": 0.2,
+  "seed": 42
+}
