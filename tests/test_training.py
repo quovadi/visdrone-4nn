@@ -243,3 +243,97 @@ def test_cuda_amp_scaler_checkpoint(tmp_path):
     # This must also execute successfully with the restored GPU Adam buffers.
     train_epoch(new_model, loader, new_optimizer, torch.nn.CrossEntropyLoss(), new_scaler,
                 torch.device('cuda'), amp=True)
+
+
+class SimulatedGradScaler:
+    """Deterministic overflow/growth simulation, independent of CUDA hardware."""
+    def __init__(self, outcomes):
+        self.outcomes = iter(outcomes)
+        self.current_scale = 8.0
+
+    def get_scale(self):
+        return self.current_scale
+
+    def scale(self, loss):
+        return loss
+
+    def step(self, optimizer):
+        self.success, self.grow = next(self.outcomes)
+        if self.success:
+            optimizer.step()  # AdamW returns None on success as well.
+        return None
+
+    def update(self):
+        if not self.success:
+            self.current_scale /= 2
+        elif self.grow:
+            self.current_scale *= 2
+
+
+@pytest.mark.parametrize('outcomes,successful,skipped', [
+    ([(True, False), (True, False)], 2, 0),
+    ([(True, True), (True, False)], 2, 0),
+    ([(False, False), (False, False)], 0, 2),
+    ([(False, False), (True, False)], 1, 1),
+])
+def test_optimizer_step_counts(outcomes, successful, skipped):
+    seed_everything(42)
+    model, optimizer, _, _ = components()
+    initial = {k: v.clone() for k, v in model.state_dict().items()}
+    loader = DataLoader(TensorDataset(torch.randn(4, 3, 8, 8), torch.arange(4)), batch_size=2)
+    with patch.object(optimizer, 'step', wraps=optimizer.step) as step:
+        result = train_epoch(model, loader, optimizer, torch.nn.CrossEntropyLoss(),
+                             SimulatedGradScaler(outcomes), torch.device('cpu'))
+    assert result['optimizer_steps'] == successful
+    assert result['amp_skipped_steps'] == skipped
+    assert step.call_count == successful
+    assert any(not torch.equal(v, initial[k]) for k, v in model.state_dict().items()) == bool(successful)
+
+
+def test_disabled_scaler_counts_successes():
+    model, optimizer, _, scaler = components()
+    loader = DataLoader(TensorDataset(torch.randn(3, 3, 8, 8), torch.arange(3)), batch_size=2)
+    result = train_epoch(model, loader, optimizer, torch.nn.CrossEntropyLoss(), scaler, torch.device('cpu'))
+    assert result['optimizer_steps'] == 2 and result['amp_skipped_steps'] == 0
+
+
+def test_scheduler_stays_unchanged_with_no_optimizer_steps(tmp_path):
+    config = fixture_data(tmp_path)
+    def skipped_epoch(*args, **kwargs):
+        # Exercise the actual epoch loop with every optimizer update skipped.
+        args = list(args)
+        args[4] = SimulatedGradScaler([(False, False)] * 3)
+        return train_epoch(*args, **kwargs)
+    with patch('training.run.build_model', side_effect=tiny_model), \
+            patch('training.run.train_epoch', side_effect=skipped_epoch):
+        run = run_training(config)
+    state = read_checkpoint(run / 'last.pt')
+    assert state['scheduler']['last_epoch'] == 0
+    assert state['optimizer']['param_groups'][0]['lr'] == config.lr
+    assert not state['optimizer']['state']
+    assert all(r['train']['optimizer_steps'] == 0 and r['train']['amp_skipped_steps'] == 3
+               for r in state['history'])
+
+
+def test_original_stage2_checkpoint_resume(tmp_path):
+    from training.run import compatible_sources, provenance
+    config = fixture_data(tmp_path)
+    original = provenance()
+    original['source_sha256'].update({
+        'training/engine.py': '9d85f633ca38f161bd98a9686ed57b4b313a8a76b5b820aba9ba105e1a2f38df',
+        'training/run.py': '548c68e9f57ef7014e1ad33a5fc1cf168da024baa401ba46a47fbf75d3b2bb7d',
+    })
+    current = provenance()['source_sha256']
+    assert compatible_sources(original['source_sha256'], current)
+    assert not compatible_sources({**original['source_sha256'], 'data/visdrone.py': 'changed'}, current)
+    with patch('training.run.build_model', side_effect=tiny_model):
+        with patch('training.run.provenance', return_value=original):
+            run = run_training(config)
+        state = read_checkpoint(run / 'last.pt')
+        # Old histories do not contain the new diagnostic fields.
+        for row in state['history']:
+            row['train'].pop('optimizer_steps')
+            row['train'].pop('amp_skipped_steps')
+        torch.save(state, run / 'last.pt')
+        run_training(config, run)
+        assert json.loads((run / 'provenance.json').read_text())['source_sha256'] == current
