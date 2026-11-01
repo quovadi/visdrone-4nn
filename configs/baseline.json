@@ -1,0 +1,23 @@
+{
+  "models": {
+    "convnext_base": "convnext_base.fb_in1k",
+    "convnext_nano": "convnext_nano.d1h_in1k",
+    "vit_base": "vit_base_patch16_224.augreg_in1k",
+    "tinyvit": "tiny_vit_5m_224.dist_in22k_ft_in1k"
+  },
+  "defaults": {
+    "root": "/content/drive/MyDrive/VisDrone",
+    "indices": "/content/drive/MyDrive/visdrone-results/data-v1",
+    "output": "/content/drive/MyDrive/visdrone-results/baseline-v1",
+    "batch_size": 8,
+    "epochs": 10,
+    "lr": 0.0001,
+    "weight_decay": 0.05,
+    "workers": 2,
+    "seed": 42,
+    "train_size": null,
+    "smoke": false,
+    "amp": true,
+    "device": "auto"
+  }
+}
