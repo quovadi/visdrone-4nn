@@ -61,6 +61,18 @@ def provenance():
             'python': os.sys.version, 'cuda_runtime': torch.version.cuda}
 
 
+def compatible_sources(saved, current):
+    if saved == current:
+        return True
+    # Narrow migration from the original stage-2 code. All other source and
+    # configuration fingerprints must match; arbitrary code changes still fail.
+    legacy = {
+        'training/engine.py': '9d85f633ca38f161bd98a9686ed57b4b313a8a76b5b820aba9ba105e1a2f38df',
+        'training/run.py': '548c68e9f57ef7014e1ad33a5fc1cf168da024baa401ba46a47fbf75d3b2bb7d',
+    }
+    return saved == {**current, **legacy}
+
+
 def new_run_directory(config):
     output = Path(config.output).resolve()
     indices = Path(config.indices).resolve()
@@ -91,12 +103,15 @@ def run_training(config, resume=None):
         if expected != saved:
             raise ValueError('Resume configuration differs from checkpoint; create a new run')
         old = state['provenance']
-        if (old['source_sha256'] != evidence['source_sha256']
+        if (not compatible_sources(old['source_sha256'], evidence['source_sha256'])
                 or old['versions'] != evidence['versions']):
             raise ValueError('Code/dependency versions changed; restore recorded environment for resume')
         if old['device_type'] != device.type or old['amp_enabled'] != amp:
             raise ValueError('Resume requires the same device type and AMP mode')
-        evidence = old
+        evidence = {**old, **evidence}
+        if old['source_sha256'] != evidence['source_sha256']:
+            evidence['resumed_from_source_sha256'] = old['source_sha256']
+            write_json(run / 'provenance.json', evidence)
     else:
         run = new_run_directory(config)
         evidence.update(device_type=device.type, amp_enabled=amp,
@@ -145,7 +160,8 @@ def run_training(config, resume=None):
         metrics = validate(model, val_loader, criterion, device, amp)
         if not np.isfinite(metrics['loss']):
             raise FloatingPointError('Non-finite validation loss')
-        scheduler.step()  # Persist state for the NEXT epoch, after optimization.
+        if training['optimizer_steps'] > 0:
+            scheduler.step()  # Advance only after an actual optimizer update.
         row = {'epoch': epoch + 1, 'lr': learning_rate, 'train': training,
                'validation': metrics, 'seconds': time.monotonic() - started}
         history.append(row)
