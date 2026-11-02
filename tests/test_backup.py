@@ -203,3 +203,22 @@ def test_parent_source_compatibility_and_foreign_checkpoint(tmp_path):
     (durable / 'backup.json').write_text(json.dumps(record))
     with pytest.raises(BackupError, match='different run'):
         verify_backup(durable)
+
+
+
+def test_corrupt_primary_manifest_recovers_from_valid_pending_intent(tmp_path):
+    config = replace(config_for(tmp_path), smoke=True)
+    with patch('training.run.build_model', side_effect=tiny_model):
+        run = run_training(config)
+    durable = durable_for(run)
+    pending_path = durable / 'backup_pending.json'
+    pending = json.loads(pending_path.read_text())
+    assert pending['sha256'] == file_digest(durable / 'last.pt')
+
+    # Simulate a torn/corrupt primary manifest while the verified intent survives.
+    (durable / 'backup.json').write_text('{"truncated":')
+    state = verify_backup(durable)
+
+    assert state['epoch'] + 1 == pending['completed_epoch']
+    assert json.loads((durable / 'backup.json').read_text()) == pending
+    assert verify_backup(durable)['epoch'] == state['epoch']
