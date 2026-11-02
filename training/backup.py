@@ -99,28 +99,32 @@ def verify_backup(destination):
                 continue
             try:
                 candidate = read_json(manifest)
-                if not isinstance(candidate, dict):
-                    raise BackupError('Manifest is not a JSON object')
-                if candidate.get('sha256') != digest:
-                    continue
-                if candidate.get('run_id') != owner['run_id']:
-                    raise BackupError('Backup belongs to a different run')
-                if candidate.get('file_size_bytes') != size:
-                    raise BackupError('Backup size mismatch')
-                metadata_hashes = candidate.get('metadata_sha256')
-                if not isinstance(metadata_hashes, dict):
-                    raise BackupError('Missing metadata checksums')
-                for metadata_name in ('config.json', 'data.json', 'preprocessing.json'):
-                    expected_hash = metadata_hashes.get(metadata_name)
-                    if (not isinstance(expected_hash, str)
-                            or file_digest(destination / metadata_name) != expected_hash):
-                        raise BackupError(f'Run metadata checksum mismatch: {metadata_name}')
-                record = candidate
-                break
-            except Exception as exc:
-                # A damaged primary manifest must not prevent checking the
-                # independently verified pending intent.
+            except (json.JSONDecodeError, UnicodeError) as exc:
+                # An interrupted JSON write may be repaired by a valid intent.
                 errors.append(f'{name}: {exc}')
+                continue
+            if not isinstance(candidate, dict):
+                raise BackupError(f'{name}: Manifest is not a JSON object')
+            # A parseable foreign-run manifest is NOT a torn publication.
+            # Never bypass a failed ownership check using backup_pending.json.
+            if candidate.get('run_id') != owner['run_id']:
+                raise BackupError('Backup belongs to a different run')
+            if candidate.get('sha256') != digest:
+                # Legitimate state between publishing a new last.pt and
+                # replacing the previous generation's backup.json.
+                continue
+            if candidate.get('file_size_bytes') != size:
+                raise BackupError('Backup size mismatch')
+            metadata_hashes = candidate.get('metadata_sha256')
+            if not isinstance(metadata_hashes, dict):
+                raise BackupError('Missing metadata checksums')
+            for metadata_name in ('config.json', 'data.json', 'preprocessing.json'):
+                expected_hash = metadata_hashes.get(metadata_name)
+                if (not isinstance(expected_hash, str)
+                        or file_digest(destination / metadata_name) != expected_hash):
+                    raise BackupError(f'Run metadata checksum mismatch: {metadata_name}')
+            record = candidate
+            break
 
         if record is None:
             detail = '; '.join(errors)
