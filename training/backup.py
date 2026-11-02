@@ -81,34 +81,66 @@ def sync_checkpoint(run, destination):
 
 
 def verify_backup(destination):
-    """Recover stale/missing manifest only from a matching verified intent."""
+    """Verify either manifest independently; repair backup.json from a valid intent."""
     destination = Path(destination)
     try:
         owner = read_json(destination / 'storage.json')
-        digest = file_digest(destination / 'last.pt')
-        record = None
-        for name in ('backup.json', 'backup_pending.json'):
-            if (destination / name).exists():
-                candidate = read_json(destination / name)
-                if candidate['sha256'] == digest:
-                    record = candidate
-                    break
-        if record is None:
-            raise BackupError('No manifest or verified intent matches checkpoint SHA-256')
-        if record['run_id'] != owner['run_id']:
-            raise BackupError('Backup belongs to a different run')
-        if record['file_size_bytes'] != (destination / 'last.pt').stat().st_size:
-            raise BackupError('Backup size mismatch')
-        for name in ('config.json', 'data.json', 'preprocessing.json'):
-            if file_digest(destination / name) != record['metadata_sha256'][name]:
-                raise BackupError(f'Run metadata checksum mismatch: {name}')
-        state = read_checkpoint(destination / 'last.pt')
+        if not isinstance(owner, dict) or not owner.get('run_id'):
+            raise BackupError('Missing durable run identity')
+        checkpoint = destination / 'last.pt'
+        digest = file_digest(checkpoint)
+        state = read_checkpoint(checkpoint)
         validate_state(state, destination, owner['run_id'])
-        if (state['epoch'] + 1 != record['completed_epoch'] or
-                state['format_version'] != record['checkpoint_format_version']):
-            raise BackupError('Backup epoch/format mismatch')
-        if not (destination / 'backup.json').exists() or read_json(destination / 'backup.json') != record:
-            write_json(destination / 'backup.json', record)
+        size = checkpoint.stat().st_size
+
+        record = None
+        errors = []
+        for name in ('backup.json', 'backup_pending.json'):
+            manifest = destination / name
+            if not manifest.is_file():
+                continue
+            try:
+                candidate = read_json(manifest)
+                if not isinstance(candidate, dict):
+                    raise BackupError('Manifest is not a JSON object')
+                if candidate.get('sha256') != digest:
+                    continue
+                if candidate.get('run_id') != owner['run_id']:
+                    raise BackupError('Backup belongs to a different run')
+                if candidate.get('file_size_bytes') != size:
+                    raise BackupError('Backup size mismatch')
+                metadata_hashes = candidate.get('metadata_sha256')
+                if not isinstance(metadata_hashes, dict):
+                    raise BackupError('Missing metadata checksums')
+                for metadata_name in ('config.json', 'data.json', 'preprocessing.json'):
+                    expected_hash = metadata_hashes.get(metadata_name)
+                    if (not isinstance(expected_hash, str)
+                            or file_digest(destination / metadata_name) != expected_hash):
+                        raise BackupError(f'Run metadata checksum mismatch: {metadata_name}')
+                if (state['epoch'] + 1 != candidate.get('completed_epoch')
+                        or state['format_version'] != candidate.get('checkpoint_format_version')):
+                    raise BackupError('Backup epoch/format mismatch')
+                record = candidate
+                break
+            except Exception as exc:
+                # A damaged primary manifest must not prevent checking the
+                # independently verified pending intent.
+                errors.append(f'{name}: {exc}')
+
+        if record is None:
+            detail = '; '.join(errors)
+            message = 'No valid manifest or verified intent matches checkpoint SHA-256'
+            if detail:
+                message += f' ({detail})'
+            raise BackupError(message)
+
+        primary = destination / 'backup.json'
+        try:
+            primary_record = read_json(primary) if primary.is_file() else None
+        except Exception:
+            primary_record = None
+        if primary_record != record:
+            write_json(primary, record)
         return state
     except Exception as exc:
         raise BackupError(f'Cannot restore trusted full backup: {exc}') from exc
