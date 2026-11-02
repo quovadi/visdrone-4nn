@@ -40,12 +40,14 @@ def restore_rng(state):
 
 
 def save_checkpoint(path, model, optimizer, scheduler, scaler, epoch,
-                    best_f1, config, history, data_metadata, provenance):
+                    best_f1, config, history, data_metadata, provenance, best_selection=None):
     payload = {'format_version': FORMAT_VERSION, 'model': model.state_dict(),
                'optimizer': optimizer.state_dict(), 'scheduler': scheduler.state_dict(),
                'scaler': scaler.state_dict(), 'epoch': epoch, 'best_f1': best_f1,
                'config': config, 'history': history, 'rng': rng_state(),
                'data_metadata': data_metadata, 'provenance': provenance}
+    if best_selection is not None:
+        payload['best_selection'] = best_selection
     atomic_save(path, lambda p: torch.save(payload, p))
 
 
@@ -69,3 +71,28 @@ def restore_checkpoint(state, model, optimizer, scheduler, scaler):
     scaler.load_state_dict(state['scaler'])
     restore_rng(state['rng'])
     return state['epoch'] + 1, state['best_f1']
+
+
+def export_weights(path, model):
+    """Plain CPU state_dict: floating tensors in FP32, integer buffers preserved."""
+    export_state_dict(path, model.state_dict())
+
+
+def export_state_dict(path, state):
+    weights = {name: tensor.detach().to(device='cpu', dtype=torch.float32
+               if tensor.is_floating_point() else tensor.dtype).clone()
+               for name, tensor in state.items()}
+    atomic_save(path, lambda p: torch.save(weights, p))
+
+
+def load_weights(path, model):
+    """Safe tensor-only loading; use the matching config/preprocessing JSON files."""
+    path = Path(path)
+    if (path.parent / 'storage.json').exists() and not (path.parent / 'commit.json').exists():
+        raise RuntimeError('Incomplete result publication: missing commit.json; resume from local last.pt')
+    if (path.parent / 'commit.json').exists():
+        from training.consistency import verify_commit
+        verify_commit(path.parent)
+    weights = torch.load(path, map_location='cpu', weights_only=True)
+    model.load_state_dict(weights, strict=True)
+    return model

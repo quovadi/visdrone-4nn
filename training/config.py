@@ -24,8 +24,12 @@ class TrainConfig:
     smoke: bool = False
     amp: bool = True
     device: str = 'auto'
+    economical: bool = False
+    work_dir: str | None = None
 
     def __post_init__(self):
+        if self.economical != bool(self.work_dir):
+            raise ValueError("economical requires work_dir; work_dir requires economical")
         for name in ('batch_size', 'epochs'):
             if type(getattr(self, name)) is not int or getattr(self, name) < 1:
                 raise ValueError(f'{name} must be a positive integer')

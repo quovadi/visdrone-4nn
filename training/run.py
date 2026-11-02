@@ -22,7 +22,9 @@ from training.data import make_datasets, epoch_loaders
 from training.engine import train_epoch
 from training.validation import validate
 from training.checkpoint import (read_checkpoint, restore_checkpoint, save_checkpoint,
-                                 write_json)
+                                 write_json, export_weights)
+from training.consistency import reconcile, tensor_digest
+from training.storage import check_separate, durable_directory, sync_results
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -70,7 +72,25 @@ def compatible_sources(saved, current):
         'training/engine.py': '9d85f633ca38f161bd98a9686ed57b4b313a8a76b5b820aba9ba105e1a2f38df',
         'training/run.py': '548c68e9f57ef7014e1ad33a5fc1cf168da024baa401ba46a47fbf75d3b2bb7d',
     }
-    return saved == {**current, **legacy}
+    candidates = [{**current, **legacy}]
+    prior = {
+        'training/config.py': '513e052e0aa1c7fc96b8717ecb7944e7f9bb973ab5343ccb7b040b42e035f691',
+        'training/checkpoint.py': 'a55f7c3ef91d6e2305ede6aa15289fe799763d64502c1fd688b78ff250a73a35',
+        'training/run.py': 'a16b0554002caa15801bfbee694efbddcdeb217d939fdbdbca2860baf02b7acd',
+    }
+    previous = {k: v for k, v in {**current, **prior}.items() if k != 'training/storage.py'}
+    candidates.extend([previous, {**previous, **legacy}])
+    pr2 = {**current,
+        'training/run.py': '9afd8f9237d54784e56a3ca63f04b340a909698f2c4c183d4e636eb96f563d3d',
+        'training/checkpoint.py': '5c77835464c723cf5529c6e9fd2b87498b0e2b3451aca7dfab18df2f9b65ae77'}
+    pr2['training/storage.py'] = '13402ab2ca280fb022481a8a9ee6dcc63db72c7e11b06ff87219302e8c553745'
+    pr2.pop('training/consistency.py', None)
+    candidates.append(pr2)
+    for candidate in list(candidates):
+        legacy_candidate = dict(candidate)
+        legacy_candidate.pop('training/consistency.py', None)
+        candidates.append(legacy_candidate)
+    return saved in candidates
 
 
 def new_run_directory(config):
@@ -78,6 +98,10 @@ def new_run_directory(config):
     indices = Path(config.indices).resolve()
     if output == indices or indices in output.parents or output in indices.parents:
         raise ValueError('Results and frozen data-v1 must be separate directory trees')
+    if config.economical:
+        check_separate(config.work_dir, config.output)
+        check_separate(config.work_dir, config.indices)
+        output = Path(config.work_dir).resolve()
     # Model-specific parent; unique identifier and exclusive mkdir prevent overwrite.
     stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
     prefix = 'smoke' if config.smoke else 'full'
@@ -99,7 +123,7 @@ def run_training(config, resume=None):
         run = Path(resume)
         state = read_checkpoint(run / 'last.pt')
         expected = {k: v for k, v in config.to_dict().items() if k not in ('root', 'device')}
-        saved = {k: v for k, v in state['config'].items() if k not in ('root', 'device')}
+        saved = {k: v for k, v in TrainConfig(**state['config']).to_dict().items() if k not in ('root', 'device')}
         if expected != saved:
             raise ValueError('Resume configuration differs from checkpoint; create a new run')
         old = state['provenance']
@@ -123,7 +147,10 @@ def run_training(config, resume=None):
                 archive.write(path, path.relative_to(REPO))
         freeze = subprocess.run([os.sys.executable, '-m', 'pip', 'freeze'], capture_output=True, text=True, check=True)
         (run / 'environment.txt').write_text(freeze.stdout)
+    durable = durable_directory(config, run, resume=resume is not None)
     print(f'RUN_DIR={run}', flush=True)
+    if durable is not None:
+        print(f'DURABLE_DIR={durable}', flush=True)
     # Exactly one architecture in memory. Pretrained is mandatory for a new run.
     model, data_config = build_model(config.model_id, pretrained=state is None)
     train_transform, val_transform = make_transforms(data_config)
@@ -137,6 +164,10 @@ def run_training(config, resume=None):
         write_json(run / 'data.json', data_metadata)
         write_json(run / 'preprocessing.json', {'data_config': data_config,
                    'train': str(train_transform), 'validation': str(val_transform)})
+    selection = None
+    if state is not None:
+        selection = reconcile(run, state, config.economical, durable)
+        sync_results(run, durable)
     model.to(device)
     criterion = torch.nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr,
@@ -170,13 +201,20 @@ def run_training(config, resume=None):
         arguments = (model, optimizer, scheduler, scaler, epoch, best_f1,
                      config.to_dict(), history, data_metadata, evidence)
         if improved:
-            save_checkpoint(run / 'best.pt', *arguments)
-        save_checkpoint(run / 'last.pt', *arguments)
-        write_json(run / 'metrics.json', history)
+            export_weights(run / 'best_pending.pt', model)
+            selection = {'epoch': epoch + 1, 'score': best_f1,
+                         'sha256': tensor_digest(model.state_dict())}
+        save_checkpoint(run / 'last.pt', *arguments, best_selection=selection)
+        # The atomic last.pt replacement is the commit point. Publication is
+        # idempotent and can be completed after interruption from this state.
+        if improved and not config.economical:
+            save_checkpoint(run / 'best.pt', *arguments, best_selection=selection)
+        committed = {'history': history, 'epoch': epoch, 'best_f1': best_f1,
+                     'best_selection': selection, 'config': config.to_dict(),
+                     'model': model.state_dict()}
+        selection = reconcile(run, committed, config.economical, durable)
+        sync_results(run, durable, weights=improved)
         print(json.dumps(row, allow_nan=False), flush=True)
-    write_json(run / 'summary.json', {'completed_epochs': len(history),
-               'best_validation_macro_f1': best_f1, 'smoke': config.smoke,
-               'selection_metric': 'validation macro-F1, all 10 labels; first maximum'})
     return run
 
 
@@ -184,12 +222,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--model', choices=('convnext_base', 'convnext_nano', 'vit_base', 'tinyvit'))
     parser.add_argument('--resume', type=Path, help='Existing RUN_DIR containing config.json and last.pt')
-    for option in ('root', 'indices', 'output', 'device'):
+    for option in ('root', 'indices', 'output', 'device', 'work-dir'):
         parser.add_argument(f'--{option}')
     for option in ('batch-size', 'epochs', 'workers', 'seed', 'train-size'):
         parser.add_argument(f'--{option}', type=int)
     for option in ('lr', 'weight-decay'):
         parser.add_argument(f'--{option}', type=float)
+    parser.add_argument('--economical', action='store_true', default=None)
     parser.add_argument('--smoke', action='store_true', default=None)
     parser.add_argument('--amp', action=argparse.BooleanOptionalAction, default=None)
     args = vars(parser.parse_args())
