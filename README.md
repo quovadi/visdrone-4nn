@@ -313,3 +313,96 @@ fingerprints и версии должны совпасть. Переход фи�
 старым кодом шаги scheduler при resume не отменяются; изменённое поведение
 применяется к следующим эпохам. Проверка прежнего строгого соответствия кода
 остаётся в силе для всех прочих изменений.
+
+## Экономное хранение для Google Colab
+
+Поведение без новых флагов сохраняется: полный `best.pt` и `last.pt` в OUTPUT.
+Дополнительно экспортируется `best_weights.pt`. Архитектуры, preprocessing,
+оптимизация, AMP и метрики не меняются.
+
+В экономном режиме используйте два отдельных дерева каталогов:
+
+```bash
+python -m training.run --model convnext_nano --smoke --device cuda --economical --work-dir /content/visdrone-work --output /content/drive/MyDrive/visdrone-results/baseline-v1
+```
+
+После проверки smoke запустите ту же команду без `--smoke`. Для остальных моделей
+замените `--model` и сначала выполните их smoke. Параметры:
+
+- `--economical`: не создавать полный best.pt, экспортировать лучшие веса/метаданные.
+- `--work-dir`: обязательный локальный базовый каталог при `--economical`.
+- `--output`: долговременное хранилище результатов (Drive); прежний default сохранён.
+
+RUN_DIR печатается для локального каталога, DURABLE_DIR — для Drive.
+Имена `<model>/<smoke|full>-<timestamp>-<uuid>` совпадают в обоих деревьях.
+В локальном RUN_DIR остаётся полный **last.pt** (model/AdamW/scheduler/scaler/RNG,
+config/history/data/provenance). На Drive **не копируются last.pt и best.pt**.
+При улучшении validation macro-F1 сохраняется `best_weights.pt`; на Drive также
+копируются config.json, preprocessing.json, data.json, provenance.json, metrics.json,
+summary.json (в конце), storage.json, source.zip и environment.txt. Никаких файлов
+data-v1 и holdout этот механизм не читает/не меняет. Экспорт начальных метаданных
+выполняется до обучения; метрик — после каждой завершённой эпохи.
+
+`best_weights.pt` — обычный `state_dict` без optimizer, RNG и Python-объектов:
+все floating tensors в FP32 на CPU, целочисленные buffers сохраняют dtype.
+Модель в памяти не преобразуется в FP32 и не изменяется экспортом.
+JSON сохраняет полный timm ID/10 классов, параметры normalization/resize,
+fingerprints индексов и provenance. Лучшая эпоха определяется первым максимумом
+validation macro-F1 в metrics.json; это не обязательно последняя эпоха.
+
+Безопасная загрузка для последующей оценки (без pretrained-загрузки):
+
+```python
+import json
+from pathlib import Path
+from training.models import build_model, make_transforms
+from training.checkpoint import load_weights
+run = Path('/content/drive/MyDrive/visdrone-results/baseline-v1/MODEL/RUN_NAME')
+cfg = json.loads((run / 'config.json').read_text())
+model, _ = build_model(cfg['model_id'], pretrained=False)
+load_weights(run / 'best_weights.pt', model)  # torch.load(weights_only=True), strict=True
+model.eval()
+data_config = json.loads((run / 'preprocessing.json').read_text())['data_config']
+_, evaluation_transform = make_transforms(data_config)
+```
+
+Продолжение при живом локальном каталоге:
+
+```bash
+python -m training.run --resume /content/visdrone-work/convnext_nano/RUN_NAME
+```
+
+Флаги режима повторять не требуется: они читаются из config.json. Исходный
+DURABLE_DIR и его storage.json должны оставаться доступны. Пути output и режим
+не меняются через resume. Перенос всего локального RUN_DIR с сохранением файлов
+допустим: --resume указывает его новое расположение. Для изображений по-прежнему
+можно указать --root, не меняя индексы.
+
+**При уничтожении runtime Colab локальный last.pt может исчезнуть.** Компактные
+веса на Drive позволяют оценивать модель, но не восстанавливают AdamW/scaler/RNG.
+Если требуется полное продолжение после сброса runtime, пользователь должен
+заранее вручную сохранить last.pt вместе с остальными файлами конкретного RUN_DIR
+в долговременное хранилище (при наличии места), затем восстановить RUN_DIR в
+/content и выполнить --resume. Автоматического резервного копирования полного
+checkpoint и удаления старых экспериментов нет. До конца первой эпохи last.pt нет.
+
+Для старых запусков обычный --resume сохранён: старый config получает значения
+новых полей по умолчанию. Разрешены точные fingerprints исходного этапа 2 и
+исправления AMP; остальные проверки кода/версий/данных остаются. Если отсутствует
+best_weights.pt и имеется доверенный best.pt, resume экспортирует именно его
+исторические лучшие веса, не last. Формат полноценных checkpoint не изменён.
+Загружайте full checkpoint только из собственных доверенных файлов
+(`weights_only=False` необходим для RNG). Режим существующего запуска не меняется;
+новый экономный эксперимент создаётся отдельной командой.
+
+Все checkpoint/экспортные файлы записываются через уникальный временный файл и
+rename. Новые каталоги создаются эксклюзивно. storage.json связывает локальный
+и долговременный каталог идентификатором запуска; чужой/существующий каталог не
+присваивается. Синхронизация использует явный список файлов и не переносит
+произвольные .pt. Старые эксперименты не удаляются. При ошибке записи прежний файл
+сохраняется, ошибка останавливает запуск; повторный resume повторяет экспорт.
+Набор файлов не является общей транзакцией, а Drive FUSE не гарантирует fsync:
+после сбоя завершите успешный resume/экспорт перед оценкой результатов. Нужны
+место под временную копию заменяемого файла и отсутствие параллельных resume одного
+RUN_DIR. Числа 57.1/171.4 МиБ для Nano предоставлены пользователем; в этой среде
+размер на реальном обучении и работа Drive/T4 не измерялись.

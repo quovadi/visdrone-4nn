@@ -69,3 +69,22 @@ def restore_checkpoint(state, model, optimizer, scheduler, scaler):
     scaler.load_state_dict(state['scaler'])
     restore_rng(state['rng'])
     return state['epoch'] + 1, state['best_f1']
+
+
+def export_weights(path, model):
+    """Plain CPU state_dict: floating tensors in FP32, integer buffers preserved."""
+    export_state_dict(path, model.state_dict())
+
+
+def export_state_dict(path, state):
+    weights = {name: tensor.detach().to(device='cpu', dtype=torch.float32
+               if tensor.is_floating_point() else tensor.dtype).clone()
+               for name, tensor in state.items()}
+    atomic_save(path, lambda p: torch.save(weights, p))
+
+
+def load_weights(path, model):
+    """Safe tensor-only loading; use the matching config/preprocessing JSON files."""
+    weights = torch.load(path, map_location='cpu', weights_only=True)
+    model.load_state_dict(weights, strict=True)
+    return model
