@@ -22,7 +22,8 @@ from training.data import make_datasets, epoch_loaders
 from training.engine import train_epoch
 from training.validation import validate
 from training.checkpoint import (read_checkpoint, restore_checkpoint, save_checkpoint,
-                                 write_json, export_weights, export_state_dict)
+                                 write_json, export_weights)
+from training.consistency import reconcile, tensor_digest
 from training.storage import check_separate, durable_directory, sync_results
 
 REPO = Path(__file__).resolve().parents[1]
@@ -79,6 +80,16 @@ def compatible_sources(saved, current):
     }
     previous = {k: v for k, v in {**current, **prior}.items() if k != 'training/storage.py'}
     candidates.extend([previous, {**previous, **legacy}])
+    pr2 = {**current,
+        'training/run.py': '9afd8f9237d54784e56a3ca63f04b340a909698f2c4c183d4e636eb96f563d3d',
+        'training/checkpoint.py': '5c77835464c723cf5529c6e9fd2b87498b0e2b3451aca7dfab18df2f9b65ae77'}
+    pr2['training/storage.py'] = '13402ab2ca280fb022481a8a9ee6dcc63db72c7e11b06ff87219302e8c553745'
+    pr2.pop('training/consistency.py', None)
+    candidates.append(pr2)
+    for candidate in list(candidates):
+        legacy_candidate = dict(candidate)
+        legacy_candidate.pop('training/consistency.py', None)
+        candidates.append(legacy_candidate)
     return saved in candidates
 
 
@@ -153,12 +164,10 @@ def run_training(config, resume=None):
         write_json(run / 'data.json', data_metadata)
         write_json(run / 'preprocessing.json', {'data_config': data_config,
                    'train': str(train_transform), 'validation': str(val_transform)})
-    if resume is not None and not (run / 'best_weights.pt').exists() and (run / 'best.pt').is_file():
-        # Legacy runs: export the historical best, never substitute last weights.
-        legacy_best = read_checkpoint(run / 'best.pt')
-        export_state_dict(run / 'best_weights.pt', legacy_best['model'])
-        del legacy_best
-    sync_results(run, durable)
+    selection = None
+    if state is not None:
+        selection = reconcile(run, state, config.economical, durable)
+        sync_results(run, durable)
     model.to(device)
     criterion = torch.nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr,
@@ -192,17 +201,20 @@ def run_training(config, resume=None):
         arguments = (model, optimizer, scheduler, scaler, epoch, best_f1,
                      config.to_dict(), history, data_metadata, evidence)
         if improved:
-            if not config.economical:
-                save_checkpoint(run / 'best.pt', *arguments)
-            export_weights(run / 'best_weights.pt', model)
-        save_checkpoint(run / 'last.pt', *arguments)
-        write_json(run / 'metrics.json', history)
+            export_weights(run / 'best_pending.pt', model)
+            selection = {'epoch': epoch + 1, 'score': best_f1,
+                         'sha256': tensor_digest(model.state_dict())}
+        save_checkpoint(run / 'last.pt', *arguments, best_selection=selection)
+        # The atomic last.pt replacement is the commit point. Publication is
+        # idempotent and can be completed after interruption from this state.
+        if improved and not config.economical:
+            save_checkpoint(run / 'best.pt', *arguments, best_selection=selection)
+        committed = {'history': history, 'epoch': epoch, 'best_f1': best_f1,
+                     'best_selection': selection, 'config': config.to_dict(),
+                     'model': model.state_dict()}
+        selection = reconcile(run, committed, config.economical, durable)
         sync_results(run, durable, weights=improved)
         print(json.dumps(row, allow_nan=False), flush=True)
-    write_json(run / 'summary.json', {'completed_epochs': len(history),
-               'best_validation_macro_f1': best_f1, 'smoke': config.smoke,
-               'selection_metric': 'validation macro-F1, all 10 labels; first maximum'})
-    sync_results(run, durable, weights=False)
     return run
 
 

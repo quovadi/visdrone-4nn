@@ -8,7 +8,7 @@ from training.checkpoint import atomic_save, write_json
 
 EXPORT_FILES = ('config.json', 'provenance.json', 'data.json', 'preprocessing.json',
                 'metrics.json', 'summary.json', 'storage.json', 'source.zip',
-                'environment.txt', 'best_weights.pt')
+                'environment.txt', 'best_weights.pt', 'commit.json')
 
 
 def check_separate(a, b):
