@@ -23,6 +23,7 @@ from training.engine import train_epoch
 from training.validation import validate
 from training.checkpoint import (read_checkpoint, restore_checkpoint, save_checkpoint,
                                  write_json, export_weights)
+from training.backup import sync_checkpoint, restore_run
 from training.consistency import reconcile, tensor_digest
 from training.storage import check_separate, durable_directory, sync_results
 
@@ -90,6 +91,13 @@ def compatible_sources(saved, current):
         legacy_candidate = dict(candidate)
         legacy_candidate.pop('training/consistency.py', None)
         candidates.append(legacy_candidate)
+    parent = {**current, **{'training/run.py': '3fe4afdba0d3692e53cd76c2a6555ab71d44c33e9354b17058e02b8f62d774c8', 'training/checkpoint.py': 'ed12f2d077b2fd3c42f7bc887a72d4f6e091c2d096bd5e7d32a4f31d9f30596c'}}
+    parent.pop('training/backup.py', None)
+    candidates.append(parent)
+    for candidate in list(candidates):
+        old = dict(candidate)
+        old.pop('training/backup.py', None)
+        candidates.append(old)
     return saved in candidates
 
 
@@ -166,8 +174,11 @@ def run_training(config, resume=None):
                    'train': str(train_transform), 'validation': str(val_transform)})
     selection = None
     if state is not None:
+        sync_checkpoint(run, durable)
         selection = reconcile(run, state, config.economical, durable)
         sync_results(run, durable)
+    if state is None:
+        sync_results(run, durable)  # Static metadata required for backup verification.
     model.to(device)
     criterion = torch.nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr,
@@ -204,7 +215,9 @@ def run_training(config, resume=None):
             export_weights(run / 'best_pending.pt', model)
             selection = {'epoch': epoch + 1, 'score': best_f1,
                          'sha256': tensor_digest(model.state_dict())}
-        save_checkpoint(run / 'last.pt', *arguments, best_selection=selection)
+        run_id = json.loads((run / 'storage.json').read_text())['run_id'] if durable else None
+        save_checkpoint(run / 'last.pt', *arguments, best_selection=selection, run_id=run_id)
+        sync_checkpoint(run, durable)
         # The atomic last.pt replacement is the commit point. Publication is
         # idempotent and can be completed after interruption from this state.
         if improved and not config.economical:
@@ -221,6 +234,7 @@ def run_training(config, resume=None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--model', choices=('convnext_base', 'convnext_nano', 'vit_base', 'tinyvit'))
+    parser.add_argument('--restore-from', type=Path, help='Verify and restore a trusted durable backup; print resume command')
     parser.add_argument('--resume', type=Path, help='Existing RUN_DIR containing config.json and last.pt')
     for option in ('root', 'indices', 'output', 'device', 'work-dir'):
         parser.add_argument(f'--{option}')
@@ -232,7 +246,14 @@ def main():
     parser.add_argument('--smoke', action='store_true', default=None)
     parser.add_argument('--amp', action=argparse.BooleanOptionalAction, default=None)
     args = vars(parser.parse_args())
+    restore_from = args.pop('restore_from')
     resume, model = args.pop('resume'), args.pop('model')
+    if restore_from is not None:
+        if resume is not None or model is not None or any(v is not None for k, v in args.items() if k != 'work_dir'):
+            parser.error('--restore-from accepts only optional --work-dir')
+        restored = restore_run(restore_from, args.get('work_dir'))
+        print(f'RESTORED_RUN_DIR={restored}\nResume: python -m training.run --resume {restored}')
+        return
     overrides = {key: value for key, value in args.items() if value is not None}
     if resume is None:
         if model is None:

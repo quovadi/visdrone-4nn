@@ -73,7 +73,8 @@ def test_economical_resume_and_durable_allowlist(tmp_path):
         durable = Path(json.loads((run / 'storage.json').read_text())['durable_directory'])
         assert (run / 'last.pt').is_file()
         assert not (run / 'best.pt').exists()
-        assert not list(durable.glob('last.pt')) and not list(durable.glob('best.pt'))
+        assert (durable / 'last.pt').read_bytes() == (run / 'last.pt').read_bytes()
+        assert not list(durable.glob('best.pt'))
         for name in ('best_weights.pt', 'config.json', 'data.json', 'preprocessing.json',
                      'provenance.json', 'metrics.json', 'summary.json', 'source.zip', 'environment.txt'):
             assert (durable / name).read_bytes() == (run / name).read_bytes()

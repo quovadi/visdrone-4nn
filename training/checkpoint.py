@@ -40,12 +40,14 @@ def restore_rng(state):
 
 
 def save_checkpoint(path, model, optimizer, scheduler, scaler, epoch,
-                    best_f1, config, history, data_metadata, provenance, best_selection=None):
+                    best_f1, config, history, data_metadata, provenance, best_selection=None, run_id=None):
     payload = {'format_version': FORMAT_VERSION, 'model': model.state_dict(),
                'optimizer': optimizer.state_dict(), 'scheduler': scheduler.state_dict(),
                'scaler': scaler.state_dict(), 'epoch': epoch, 'best_f1': best_f1,
                'config': config, 'history': history, 'rng': rng_state(),
                'data_metadata': data_metadata, 'provenance': provenance}
+    if run_id is not None:
+        payload['run_id'] = run_id
     if best_selection is not None:
         payload['best_selection'] = best_selection
     atomic_save(path, lambda p: torch.save(payload, p))
