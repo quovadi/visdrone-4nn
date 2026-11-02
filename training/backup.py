@@ -89,8 +89,6 @@ def verify_backup(destination):
             raise BackupError('Missing durable run identity')
         checkpoint = destination / 'last.pt'
         digest = file_digest(checkpoint)
-        state = read_checkpoint(checkpoint)
-        validate_state(state, destination, owner['run_id'])
         size = checkpoint.stat().st_size
 
         record = None
@@ -117,9 +115,6 @@ def verify_backup(destination):
                     if (not isinstance(expected_hash, str)
                             or file_digest(destination / metadata_name) != expected_hash):
                         raise BackupError(f'Run metadata checksum mismatch: {metadata_name}')
-                if (state['epoch'] + 1 != candidate.get('completed_epoch')
-                        or state['format_version'] != candidate.get('checkpoint_format_version')):
-                    raise BackupError('Backup epoch/format mismatch')
                 record = candidate
                 break
             except Exception as exc:
@@ -133,6 +128,13 @@ def verify_backup(destination):
             if detail:
                 message += f' ({detail})'
             raise BackupError(message)
+
+        # Never unpickle a checkpoint whose digest has no verified manifest.
+        state = read_checkpoint(checkpoint)
+        validate_state(state, destination, owner['run_id'])
+        if (state['epoch'] + 1 != record['completed_epoch']
+                or state['format_version'] != record['checkpoint_format_version']):
+            raise BackupError('Backup epoch/format mismatch')
 
         primary = destination / 'backup.json'
         try:
