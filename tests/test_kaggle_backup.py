@@ -89,3 +89,67 @@ def test_download_mismatch_must_fail(tmp_path, monkeypatch):
             "apricot88/test", "last.pt", hashlib.sha256(b"right").hexdigest(),
             max_attempts=2,
         )
+
+
+def test_restore_kaggle_backup_files(tmp_path, monkeypatch):
+    import json
+    import shutil
+
+    dataset = "apricot88/test"
+    backup = tmp_path / "published"
+    backup.mkdir()
+
+    names = (
+        "last.pt", "config.json", "provenance.json",
+        "data.json", "preprocessing.json", "storage.json",
+        "metrics.json", "summary.json", "commit.json",
+        "best_weights.pt", "backup.json",
+    )
+
+    for name in names:
+        (backup / name).write_bytes(("test:" + name).encode())
+
+    manifest = {
+        "dataset": dataset,
+        "files_sha256": {
+            name: kaggle_backup.sha256(backup / name)
+            for name in names
+        },
+    }
+    (backup / "kaggle-backup.json").write_text(
+        json.dumps(manifest)
+    )
+
+    def fake_kaggle(*args, **kwargs):
+        assert args[0] == "download"
+        destination = Path(args[args.index("-p") + 1])
+        for file in backup.iterdir():
+            shutil.copyfile(file, destination / file.name)
+        return ""
+
+    # This test isolates transport and integrity checking.
+    # Full PyTorch checkpoint validation is tested separately.
+    monkeypatch.setattr(kaggle_backup, "kaggle", fake_kaggle)
+
+    import training.backup
+    monkeypatch.setattr(
+        training.backup, "verify_backup", lambda directory: True
+    )
+
+    destination = tmp_path / "restored"
+    result = kaggle_backup.restore_kaggle_backup(
+        dataset, destination
+    )
+
+    assert result == destination
+    for name in names:
+        assert kaggle_backup.sha256(destination / name) == (
+            manifest["files_sha256"][name]
+        )
+
+    with pytest.raises(FileExistsError):
+        kaggle_backup.restore_kaggle_backup(
+            dataset, destination
+        )
+
+    assert not (destination / "kaggle-backup.json").exists()
