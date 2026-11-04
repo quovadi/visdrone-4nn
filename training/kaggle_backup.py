@@ -250,6 +250,52 @@ def canonical_recovery_paths(backup_directory):
 
 
 
+def restore_canonical_run(dataset):
+    """Restore a trusted Kaggle backup to its original run directories."""
+    from training.backup import restore_run, verify_backup
+    from training.consistency import verify_commit
+
+    with tempfile.TemporaryDirectory(
+        prefix="visdrone-canonical-recovery-"
+    ) as temporary:
+        downloaded = restore_kaggle_backup(
+            dataset, Path(temporary) / "downloaded"
+        )
+
+        durable, working = canonical_recovery_paths(downloaded)
+
+        # Never overwrite a previous or partially restored run.
+        if durable.exists() or working.exists():
+            raise FileExistsError(
+                f"Recovery path already exists: {durable} or {working}"
+            )
+
+        durable.parent.mkdir(parents=True, exist_ok=True)
+        durable.mkdir(exist_ok=False)
+
+        # Keep a partial recovery for inspection if copying fails.
+        for file in downloaded.iterdir():
+            if file.is_file():
+                shutil.copyfile(file, durable / file.name)
+
+        verify_backup(durable)
+        verify_commit(durable)
+
+        config = json.loads(
+            (durable / "config.json").read_text()
+        )
+
+        restored = restore_run(
+            durable,
+            work_dir=config["work_dir"],
+        )
+
+        if restored.resolve() != working.resolve():
+            raise RuntimeError("Unexpected restored working directory")
+
+        return restored
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run", type=Path, required=True)
