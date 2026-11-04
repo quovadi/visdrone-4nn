@@ -160,6 +160,11 @@ def publish_checkpoint(run, dataset, *, version_note=None):
     return manifest
 
 
+def restore_kaggle_backup(dataset, destination):
+    """Restore a verified Kaggle dataset to a new path."""
+    raise NotImplementedError("Restore validation pending")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run", type=Path, required=True)
