@@ -191,7 +191,7 @@ def restore_kaggle_backup(dataset, destination):
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.mkdir(exist_ok=False)
         try:
-            for filename in required:
+            for filename in (*sorted(required), "kaggle-backup.json"):
                 shutil.copyfile(stage / filename, destination / filename)
             verify_backup(destination)
         except Exception:
