@@ -69,44 +69,65 @@ def verify_dataset_file(dataset, filename, expected_sha, *, max_attempts=12):
 
 
 
-def verify_dataset_files(dataset, expected_hashes, *, max_attempts=12):
-    """Download one published dataset snapshot and verify all file hashes."""
+def verify_dataset_files(dataset, expected_hashes, *, max_attempts=None):
+    """Wait for Kaggle publication, then verify one downloaded snapshot."""
+    deadline = time.monotonic() + 900
+    attempt = 0
     last_error = None
 
-    for attempt in range(max_attempts):
+    while time.monotonic() < deadline:
+        attempt += 1
+
         try:
-            with tempfile.TemporaryDirectory(
-                prefix="visdrone-kaggle-restore-"
-            ) as directory:
-                destination = Path(directory)
+            status = kaggle(
+                "status", dataset,
+                timeout=60,
+            )
 
-                kaggle(
-                    "download", "-d", dataset,
-                    "-p", str(destination),
-                    "--unzip", "--force",
-                    timeout=1800,
+            if status.strip().splitlines()[-1].strip() != "ready":
+                last_error = RuntimeError(
+                    f"Dataset publication not ready: {status.strip()}"
                 )
+            else:
+                with tempfile.TemporaryDirectory(
+                    prefix="visdrone-kaggle-verify-"
+                ) as directory:
+                    destination = Path(directory)
 
-                for filename, expected in expected_hashes.items():
-                    file = destination / filename
-                    if not file.is_file():
-                        raise RuntimeError(
-                            f"Published backup missing file: {filename}"
-                        )
-                    if sha256(file) != expected:
-                        raise RuntimeError(
-                            f"Published SHA-256 mismatch: {filename}"
-                        )
+                    kaggle(
+                        "download", "-d", dataset,
+                        "-p", str(destination),
+                        "--unzip", "--force",
+                        timeout=1800,
+                    )
 
-                return
+                    for filename, expected in expected_hashes.items():
+                        file = destination / filename
+
+                        if not file.is_file():
+                            raise RuntimeError(
+                                f"Published backup missing: {filename}"
+                            )
+
+                        if sha256(file) != expected:
+                            raise RuntimeError(
+                                f"Published SHA-256 mismatch: {filename}"
+                            )
+
+                    return
 
         except (RuntimeError, subprocess.TimeoutExpired) as exc:
             last_error = exc
-            if attempt + 1 < max_attempts:
-                time.sleep(5)
+
+        if max_attempts is not None and attempt >= max_attempts:
+            break
+
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(15, remaining))
 
     raise RuntimeError(
-        f"Kaggle backup verification failed: {last_error}"
+        f"Kaggle backup could not be verified: {last_error}"
     )
 
 
