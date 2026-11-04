@@ -77,8 +77,12 @@ def publish_checkpoint(run, dataset, *, version_note=None):
     checkpoint = run / "last.pt"
     if not checkpoint.is_file():
         raise FileNotFoundError(checkpoint)
-    required = ("config.json", "provenance.json", "data.json",
-                "preprocessing.json", "storage.json")
+    required = (
+        "config.json", "provenance.json", "data.json",
+        "preprocessing.json", "storage.json",
+        "metrics.json", "summary.json", "commit.json",
+        "best_weights.pt", "backup.json",
+    )
     missing = [name for name in required if not (run / name).is_file()]
     if missing:
         raise FileNotFoundError(f"Missing backup metadata: {missing}")
@@ -95,6 +99,10 @@ def publish_checkpoint(run, dataset, *, version_note=None):
             "checkpoint_sha256": expected,
             "checkpoint_size_bytes": checkpoint.stat().st_size,
             "run_name": run.name,
+            "files_sha256": {
+                name: sha256(stage / name)
+                for name in (*required, "last.pt")
+            },
         }
         (stage / "kaggle-backup.json").write_text(
             json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
@@ -105,7 +113,7 @@ def publish_checkpoint(run, dataset, *, version_note=None):
         kaggle("version", "-p", str(stage),
                "-m", version_note or f"Full checkpoint {run.name}",
                timeout=1800)
-    verify_dataset_file(dataset, "last.pt", expected)
+    verify_dataset_files(dataset, manifest["files_sha256"])
     return manifest
 
 
