@@ -156,3 +156,87 @@ def test_restore_kaggle_backup_files(tmp_path, monkeypatch):
         (destination / "kaggle-backup.json").read_text()
     )
     assert restored_manifest == manifest
+
+
+def test_canonical_recovery_paths(tmp_path):
+    """Accept canonical paths; reject paths from another layout."""
+    import json
+
+    output = tmp_path / "durable"
+    work = tmp_path / "work"
+    indices = tmp_path / "indices"
+
+    backup = tmp_path / "downloaded"
+    backup.mkdir()
+
+    config = {
+        "model": "convnext_base",
+        "output": str(output),
+        "work_dir": str(work),
+        "indices": str(indices),
+        "economical": True,
+    }
+    run_name = "full-test-run"
+
+    (backup / "config.json").write_text(json.dumps(config))
+    (backup / "kaggle-backup.json").write_text(
+        json.dumps({"run_name": run_name})
+    )
+
+    storage_file = backup / "storage.json"
+
+    # Wrong directory layout must be rejected.
+    storage_file.write_text(json.dumps({
+        "durable_directory": str(output / run_name)
+    }))
+
+    with pytest.raises(
+        ValueError, match="Noncanonical checkpoint storage path"
+    ):
+        kaggle_backup.canonical_recovery_paths(backup)
+
+    # Correct directory layout must be accepted.
+    expected_durable = output / "convnext_base" / run_name
+    expected_working = work / "convnext_base" / run_name
+
+    storage_file.write_text(json.dumps({
+        "durable_directory": str(expected_durable)
+    }))
+
+    durable, working = kaggle_backup.canonical_recovery_paths(backup)
+
+    assert durable == expected_durable.resolve()
+    assert working == expected_working.resolve()
+
+
+def test_canonical_restore_refuses_overwrite(tmp_path, monkeypatch):
+    """Existing run files must never be overwritten by recovery."""
+    dataset = "apricot88/test"
+
+    durable = tmp_path / "durable" / "convnext_base" / "run-1"
+    working = tmp_path / "work" / "convnext_base" / "run-1"
+
+    durable.mkdir(parents=True)
+    original = durable / "last.pt"
+    original.write_bytes(b"existing checkpoint")
+
+    def fake_download(dataset_name, destination):
+        assert dataset_name == dataset
+        destination.mkdir()
+        return destination
+
+    def fake_paths(_directory):
+        return durable, working
+
+    monkeypatch.setattr(
+        kaggle_backup, "restore_kaggle_backup", fake_download
+    )
+    monkeypatch.setattr(
+        kaggle_backup, "canonical_recovery_paths", fake_paths
+    )
+
+    with pytest.raises(FileExistsError, match="already exists"):
+        kaggle_backup.restore_canonical_run(dataset)
+
+    assert original.read_bytes() == b"existing checkpoint"
+    assert not working.exists()
