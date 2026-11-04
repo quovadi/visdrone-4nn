@@ -200,6 +200,56 @@ def restore_kaggle_backup(dataset, destination):
     return destination
 
 
+
+def canonical_recovery_paths(backup_directory):
+    """Validate recorded paths before restoring a Kaggle run."""
+    from training.storage import check_separate
+
+    backup_directory = Path(backup_directory)
+
+    manifest = json.loads(
+        (backup_directory / "kaggle-backup.json").read_text()
+    )
+    config = json.loads(
+        (backup_directory / "config.json").read_text()
+    )
+    storage = json.loads(
+        (backup_directory / "storage.json").read_text()
+    )
+
+    run_name = manifest["run_name"]
+    model = config["model"]
+
+    if (
+        not isinstance(run_name, str)
+        or run_name in ("", ".", "..")
+        or Path(run_name).name != run_name
+    ):
+        raise ValueError("Invalid run name")
+
+    if not config["economical"]:
+        raise ValueError("Expected economical checkpoint")
+
+    output = Path(config["output"]).resolve()
+    work_root = Path(config["work_dir"]).resolve()
+
+    durable = Path(storage["durable_directory"]).resolve()
+    expected_durable = output / model / run_name
+    working = work_root / model / run_name
+
+    check_separate(output, work_root)
+    check_separate(work_root, config["indices"])
+    check_separate(output, config["indices"])
+
+    if durable != expected_durable.resolve():
+        raise ValueError(
+            "Noncanonical checkpoint storage path"
+        )
+
+    return durable, working
+
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run", type=Path, required=True)
