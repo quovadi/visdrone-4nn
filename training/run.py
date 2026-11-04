@@ -227,6 +227,23 @@ def run_training(config, resume=None):
                      'model': model.state_dict()}
         selection = reconcile(run, committed, config.economical, durable)
         sync_results(run, durable, weights=improved)
+        if os.environ.get('VISDRONE_KAGGLE_DATASET'):
+            if durable is None:
+                raise RuntimeError(
+                    'Kaggle backup requires --economical and --work-dir'
+                )
+            from training.kaggle_backup import publish_checkpoint
+            dataset = os.environ['VISDRONE_KAGGLE_DATASET']
+            record = publish_checkpoint(
+                durable,
+                dataset,
+                version_note=f'{config.model} epoch {epoch + 1}',
+            )
+            print(
+                f'KAGGLE_BACKUP_VERIFIED epoch={epoch + 1} '
+                f'sha256={record["checkpoint_sha256"]}',
+                flush=True,
+            )
         print(json.dumps(row, allow_nan=False), flush=True)
     return run
 
