@@ -152,4 +152,7 @@ def test_restore_kaggle_backup_files(tmp_path, monkeypatch):
             dataset, destination
         )
 
-    assert not (destination / "kaggle-backup.json").exists()
+    restored_manifest = json.loads(
+        (destination / "kaggle-backup.json").read_text()
+    )
+    assert restored_manifest == manifest
