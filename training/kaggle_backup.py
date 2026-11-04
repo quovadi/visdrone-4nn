@@ -67,6 +67,49 @@ def verify_dataset_file(dataset, filename, expected_sha, *, max_attempts=12):
         raise RuntimeError("Kaggle did not publish the expected checkpoint")
 
 
+
+
+def verify_dataset_files(dataset, expected_hashes, *, max_attempts=12):
+    """Download one published dataset snapshot and verify all file hashes."""
+    last_error = None
+
+    for attempt in range(max_attempts):
+        try:
+            with tempfile.TemporaryDirectory(
+                prefix="visdrone-kaggle-restore-"
+            ) as directory:
+                destination = Path(directory)
+
+                kaggle(
+                    "download", "-d", dataset,
+                    "-p", str(destination),
+                    "--unzip", "--force",
+                    timeout=1800,
+                )
+
+                for filename, expected in expected_hashes.items():
+                    file = destination / filename
+                    if not file.is_file():
+                        raise RuntimeError(
+                            f"Published backup missing file: {filename}"
+                        )
+                    if sha256(file) != expected:
+                        raise RuntimeError(
+                            f"Published SHA-256 mismatch: {filename}"
+                        )
+
+                return
+
+        except (RuntimeError, subprocess.TimeoutExpired) as exc:
+            last_error = exc
+            if attempt + 1 < max_attempts:
+                time.sleep(5)
+
+    raise RuntimeError(
+        f"Kaggle backup verification failed: {last_error}"
+    )
+
+
 def publish_checkpoint(run, dataset, *, version_note=None):
     """Publish one run's last.pt; validate round-trip before reporting success.
 
