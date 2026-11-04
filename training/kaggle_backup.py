@@ -162,7 +162,42 @@ def publish_checkpoint(run, dataset, *, version_note=None):
 
 def restore_kaggle_backup(dataset, destination):
     """Restore a verified Kaggle dataset to a new path."""
-    raise NotImplementedError("Restore validation pending")
+    from training.backup import verify_backup
+    destination = Path(destination).resolve()
+    if destination.exists():
+        raise FileExistsError(f"Refusing to overwrite existing directory: {destination}")
+    required = {
+        "last.pt", "config.json", "provenance.json",
+        "data.json", "preprocessing.json", "storage.json",
+        "metrics.json", "summary.json", "commit.json",
+        "best_weights.pt", "backup.json",
+    }
+    with tempfile.TemporaryDirectory(prefix="visdrone-kaggle-restore-") as temp:
+        stage = Path(temp)
+        kaggle("download", "-d", dataset, "-p", str(stage),
+               "--unzip", "--force", timeout=1800)
+        manifest_path = stage / "kaggle-backup.json"
+        if not manifest_path.is_file():
+            raise RuntimeError("Missing Kaggle backup manifest")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        hashes = manifest.get("files_sha256")
+        if manifest.get("dataset") != dataset or not isinstance(hashes, dict) or set(hashes) != required:
+            raise RuntimeError("Invalid Kaggle backup manifest")
+        for filename, expected in hashes.items():
+            file = stage / filename
+            if not file.is_file() or not isinstance(expected, str) or sha256(file) != expected:
+                raise RuntimeError(f"Missing or corrupt backup file: {filename}")
+        verify_backup(stage)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.mkdir(exist_ok=False)
+        try:
+            for filename in required:
+                shutil.copyfile(stage / filename, destination / filename)
+            verify_backup(destination)
+        except Exception:
+            shutil.rmtree(destination)
+            raise
+    return destination
 
 
 def main():
