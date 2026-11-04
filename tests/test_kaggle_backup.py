@@ -33,8 +33,12 @@ def test_publish_stages_one_checkpoint_and_verifies_download(tmp_path, monkeypat
     run.mkdir()
     contents = b"checkpoint bytes"
     (run / "last.pt").write_bytes(contents)
-    for name in ("config.json", "provenance.json", "data.json",
-                 "preprocessing.json", "storage.json"):
+    for name in (
+        "config.json", "provenance.json", "data.json",
+        "preprocessing.json", "storage.json",
+        "metrics.json", "summary.json", "commit.json",
+        "best_weights.pt", "backup.json",
+    ):
         (run / name).write_text("{}")
     calls = []
     def fake_kaggle(*args, **kwargs):
@@ -46,15 +50,24 @@ def test_publish_stages_one_checkpoint_and_verifies_download(tmp_path, monkeypat
         calls.append("upload")
         return "Dataset version is being created"
 
-    def fake_verify(dataset, filename, digest):
-        assert (dataset, filename) == ("apricot88/test", "last.pt")
-        assert digest == hashlib.sha256(contents).hexdigest()
-        calls.append("verify")
+    def fake_verify(dataset, hashes):
+        assert dataset == "apricot88/test"
+        assert set(hashes) == {
+            "last.pt", "config.json", "provenance.json",
+            "data.json", "preprocessing.json", "storage.json",
+            "metrics.json", "summary.json", "commit.json",
+            "best_weights.pt", "backup.json",
+        }
+        for filename, digest in hashes.items():
+            assert digest == hashlib.sha256(
+                (run / filename).read_bytes()
+            ).hexdigest()
+        calls.append("verified_all")
 
     monkeypatch.setattr(kaggle_backup, "kaggle", fake_kaggle)
-    monkeypatch.setattr(kaggle_backup, "verify_dataset_file", fake_verify)
+    monkeypatch.setattr(kaggle_backup, "verify_dataset_files", fake_verify)
     manifest = kaggle_backup.publish_checkpoint(run, "apricot88/test")
-    assert calls == ["upload", "verify"]
+    assert calls == ["upload", "verified_all"]
     assert manifest["checkpoint_sha256"] == hashlib.sha256(contents).hexdigest()
 
 
