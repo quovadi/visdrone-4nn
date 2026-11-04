@@ -119,6 +119,13 @@ def new_run_directory(config):
 
 
 def run_training(config, resume=None):
+    if (
+        os.environ.get('VISDRONE_KAGGLE_DATASET')
+        and not config.economical
+    ):
+        raise ValueError(
+            'Kaggle backup requires --economical and --work-dir'
+        )
     seed_everything(config.seed)
     device = torch.device('cuda' if config.device == 'auto' and torch.cuda.is_available()
                           else 'cpu' if config.device == 'auto' else config.device)
