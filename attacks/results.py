@@ -4,8 +4,10 @@ import json
 from pathlib import Path
 import re
 import uuid
+import warnings
 import torch
 from training.checkpoint import atomic_save, write_json
+from attacks.data import canonical_hash
 from attacks.metrics import PairedMetrics
 
 FIELDS = ('run_id', 'sample_id', 'index_row', 'image', 'box', 'line', 'true_class',
@@ -37,11 +39,30 @@ def write_chunk(run, number, rows):
     atomic_save(path, writer)
 
 
-def read_predictions(run):
+def read_predictions(run, *, allow_stale_partial=False):
     run = Path(run)
     config = json.loads((run / 'config.json').read_text())
+    subset = json.loads((run / 'subset.json').read_text())
+    status = json.loads((run / 'status.json').read_text())
+    if status.get('state') not in ('running', 'failed', 'completed'):
+        raise ValueError('Unknown result status')
+    objects = subset['objects']
+    if (canonical_hash(objects) != subset['subset_sha256'] or len(objects) != subset['size']
+            or {k: v for k, v in subset.items() if k != 'objects'} != config['selection']
+            or len({obj['sample_id'] for obj in objects}) != len(objects)):
+        raise ValueError('subset.json does not match configuration/hash/size')
     seen, rows = set(), []
-    for path in sorted((run / 'predictions').glob('batch-*.csv')):
+    paths = sorted((run / 'predictions').glob('batch-*.csv'))
+    if [path.name for path in paths] != [f'batch-{i:07d}.csv' for i in range(len(paths))]:
+        raise ValueError('Missing or misnumbered CSV chunk')
+    for path in paths:
+        with path.open(newline='') as stream:
+            if csv.DictReader(stream).fieldnames != list(FIELDS):
+                raise ValueError('Invalid prediction CSV header')
+    for path in paths:
+        chunk_start = len(rows)
+        if chunk_start >= len(objects):
+            raise ValueError('Too many CSV chunks for subset.json')
         with path.open(newline='') as stream:
             for row in csv.DictReader(stream):
                 for key in ('run_id', 'model', 'model_id', 'variant', 'checkpoint', 'checkpoint_sha256'):
@@ -51,6 +72,17 @@ def read_predictions(run):
                         or int(row['seed']) != config['attack']['seed']
                         or json.loads(row['attack_parameters']) != config['attack']):
                     raise ValueError('Prediction attack configuration differs')
+                if len(rows) >= len(objects):
+                    raise ValueError('Too many prediction rows for subset.json')
+                identity = objects[len(rows)]
+                if (row['sample_id'] != identity['sample_id']
+                        or int(row['index_row']) != identity['index_row']
+                        or row['image'] != identity['image']
+                        or json.loads(row['box']) != identity['box']
+                        or int(row['line']) != identity['line']
+                        or int(row['true_class']) != identity['label']
+                        or int(row['attack_seed']) != identity['attack_seed']):
+                    raise ValueError('Prediction object identity/label differs from subset.json')
                 if row['sample_id'] in seen:
                     raise ValueError('Duplicate sample_id')
                 seen.add(row['sample_id'])
@@ -69,6 +101,22 @@ def read_predictions(run):
                 if row['clean_correct'] != correct or row['attack_success'] != success:
                     raise ValueError('Prediction flags disagree with labels')
                 rows.append(row)
+        expected_size = min(config['batch_size'], len(objects) - chunk_start)
+        if len(rows) - chunk_start != expected_size:
+            raise ValueError('Incomplete CSV chunk')
+    completed = status['state'] == 'completed'
+    if completed and len(rows) != len(objects):
+        raise ValueError('Completed result does not fully cover subset.json')
+    recomputed = summarize(rows)
+    stale = status['recorded_samples'] != len(rows)
+    metrics_path = run / 'metrics.json'
+    if rows or metrics_path.exists():
+        metrics_match = metrics_path.exists() and json.loads(metrics_path.read_text()) == recomputed
+        stale = stale or not metrics_match
+    if stale:
+        if completed or not allow_stale_partial:
+            raise ValueError('Saved metrics/status disagree with CSV predictions')
+        warnings.warn('Stale partial metrics/status: recompute from validated CSV prefix', RuntimeWarning)
     return rows
 
 

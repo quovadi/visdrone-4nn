@@ -22,7 +22,7 @@ from attacks.models import load_classifier
 from attacks.preprocessing import PixelModel, rgb_transform
 from attacks.results import create_run, read_predictions, summarize, write_chunk
 from training.models import make_transforms
-from training.consistency import file_digest
+from training.consistency import file_digest, tensor_digest
 
 
 torch.set_num_threads(1)
@@ -269,6 +269,7 @@ def test_load_only_trained_weights_and_metadata(tmp_path, kind):
         (run / f'{name}.json').write_text(json.dumps(value))
     path = Path(info['checkpoint'])
     expected = {name: value.clone() for name, value in model.state_dict().items()}
+    (run / 'commit.json').write_text(json.dumps({'sha256': {'best_weights.pt': file_digest(path)}, 'best_selection': {'sha256': tensor_digest(expected)}}))
     if kind == 'full':
         torch.save({'format_version': 1, 'model': expected, 'config': config, 'data_metadata': metadata['data']}, path)
         with pytest.raises(ValueError, match='trusted-full'):
@@ -346,3 +347,122 @@ def test_mixed_result_chunks_are_rejected(tmp_path):
         writer.writerows(rows)
     with pytest.raises(ValueError, match='another run/model/checkpoint'):
         read_predictions(run)
+
+
+@pytest.mark.parametrize('substitution', ['foreign', 'missing_commit', 'unrelated_parent_commit'])
+def test_checkpoint_is_bound_to_model_run_not_just_architecture(tmp_path, substitution):
+    root, index, model, cfg, selected, ds, info = evaluation_fixture(tmp_path)
+    metadata_run = tmp_path / 'metadata'
+    metadata_run.mkdir()
+    config = {'model': 'convnext_nano', 'model_id': MODEL_IDS[1], 'lr': 1e-4}
+    for name, value in {'config': config, 'preprocessing': {'data_config': cfg},
+                        'data': {'resolved_data_config': cfg}, 'provenance': {}}.items():
+        (metadata_run / f'{name}.json').write_text(json.dumps(value))
+    genuine = Path(info['checkpoint'])
+    commit = {'sha256': {'best_weights.pt': file_digest(genuine)}}
+    (metadata_run / 'commit.json').write_text(json.dumps(commit))
+    # Separate metadata and weights locations are accepted by content identity.
+    with patch('attacks.models.build_model', return_value=(model, cfg)):
+        loaded, _, details = load_classifier(metadata_run, genuine, 'baseline-v1')
+    assert details['model_run_commit_sha256'] == file_digest(metadata_run / 'commit.json')
+    detached = tmp_path / 'detached' / 'best_weights.pt'
+    detached.parent.mkdir()
+    detached.write_bytes(genuine.read_bytes())
+    (detached.parent / 'commit.json').write_text('{}')  # Irrelevant neighbor, not MODEL_RUN.
+    with patch('attacks.models.build_model', return_value=(model, cfg)):
+        load_classifier(metadata_run, detached, 'baseline-v1')
+    foreign = tmp_path / 'foreign' / 'best_weights.pt'
+    foreign.parent.mkdir()
+    state = {k: v.clone() for k, v in model.state_dict().items()}
+    state['2.weight'] += 1
+    torch.save(state, foreign)
+    if substitution == 'missing_commit':
+        (metadata_run / 'commit.json').unlink()
+    if substitution == 'unrelated_parent_commit':
+        # A checkpoint's own neighboring manifest cannot override MODEL_RUN.
+        (foreign.parent / 'commit.json').write_text(json.dumps({'sha256': {'best_weights.pt': file_digest(foreign)}}))
+    with patch('attacks.models.build_model') as build:
+        with pytest.raises((ValueError, FileNotFoundError)):
+            load_classifier(metadata_run, foreign, 'baseline-v1')
+        build.assert_not_called()
+
+
+@pytest.mark.parametrize('change', ['sample_id', 'index_row', 'image', 'box', 'line', 'label',
+                                    'missing_middle', 'missing_tail', 'truncated_chunk',
+                                    'metrics', 'status_count', 'subset'])
+def test_results_are_bound_to_subset_and_complete_metrics(tmp_path, change):
+    root, index, model, cfg, selected, ds, info = evaluation_fixture(tmp_path)
+    run = evaluate(PixelModel(model, cfg), ds, selected, info, cfg,
+                   AttackConfig('fgsm', 0.), tmp_path / 'results', batch_size=2)
+    paths = sorted((run / 'predictions').glob('*.csv'))
+    if change.startswith('missing_'):
+        paths[1 if change == 'missing_middle' else -1].unlink()
+    elif change == 'metrics':
+        path = run / 'metrics.json'
+        values = json.loads(path.read_text())
+        values['clean_accuracy'] = 123
+        path.write_text(json.dumps(values))
+    elif change == 'status_count':
+        path = run / 'status.json'
+        values = json.loads(path.read_text())
+        values['recorded_samples'] -= 1
+        path.write_text(json.dumps(values))
+    elif change == 'subset':
+        path = run / 'subset.json'
+        values = json.loads(path.read_text())
+        values['objects'][0]['label'] = 9
+        path.write_text(json.dumps(values))
+    else:
+        with paths[0].open(newline='') as stream:
+            reader = csv.DictReader(stream)
+            fields, rows = reader.fieldnames, list(reader)
+        modifications = {'sample_id': ('sample_id', 'foreign'), 'index_row': ('index_row', '999'),
+                         'image': ('image', 'foreign.png'), 'box': ('box', '[0,0,1,1]'),
+                         'line': ('line', '999'), 'label': ('true_class', '9')}
+        if change == 'truncated_chunk':
+            rows.pop()
+        else:
+            key, value = modifications[change]
+            rows[0][key] = value
+        with paths[0].open('w', newline='') as stream:
+            writer = csv.DictWriter(stream, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(rows)
+    with pytest.raises(ValueError):
+        read_predictions(run)
+    with pytest.raises(ValueError):
+        read_predictions(run, allow_stale_partial=True)  # Never weakens completed checks.
+
+
+def test_stale_partial_metrics_require_explicit_opt_in(tmp_path):
+    root, index, model, cfg, selected, ds, info = evaluation_fixture(tmp_path)
+    run = evaluate(PixelModel(model, cfg), ds, selected, info, cfg,
+                   AttackConfig('fgsm', 0.), tmp_path / 'results', batch_size=2)
+    (run / 'predictions' / 'batch-0000002.csv').unlink()
+    status = json.loads((run / 'status.json').read_text())
+    status['state'] = 'failed'
+    (run / 'status.json').write_text(json.dumps(status))
+    with pytest.raises(ValueError, match='metrics/status'):
+        read_predictions(run)
+    with pytest.warns(RuntimeWarning, match='Stale partial'):
+        rows = read_predictions(run, allow_stale_partial=True)
+    assert len(rows) == 4 and summarize(rows)['samples'] == 4
+
+
+def test_foreign_full_checkpoint_cannot_bypass_model_run_binding(tmp_path):
+    root, index, model, cfg, selected, ds, info = evaluation_fixture(tmp_path)
+    run = tmp_path / 'metadata'
+    run.mkdir()
+    config = {'model': 'convnext_nano', 'model_id': MODEL_IDS[1]}
+    data = {'resolved_data_config': cfg}
+    for name, value in {'config': config, 'preprocessing': {'data_config': cfg},
+                        'data': data, 'provenance': {}, 'commit': {
+                            'best_selection': {'sha256': tensor_digest(model.state_dict())}}}.items():
+        (run / f'{name}.json').write_text(json.dumps(value))
+    state = {key: value.clone() for key, value in model.state_dict().items()}
+    state['2.weight'] += 1
+    foreign = tmp_path / 'foreign-full.pt'
+    torch.save({'format_version': 1, 'model': state, 'config': config, 'data_metadata': data}, foreign)
+    with patch('attacks.models.build_model', return_value=(model, cfg)):
+        with pytest.raises(ValueError, match='committed best selection'):
+            load_classifier(run, foreign, 'baseline-v1', 'full', trusted_full=True)
