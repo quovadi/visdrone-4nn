@@ -1,8 +1,9 @@
-# VisDrone-4NN: классификация объектов — этапы 1 и 2
+# VisDrone-4NN: классификация объектов и оценка устойчивости
 
 Подготовка гражданского VisDrone-DET для сравнительного исследования архитектур.
 Реализованы подготовка данных и baseline fine-tuning четырёх pretrained-классификаторов.
-Атаки, защиты и финальная оценка holdout не реализуются на этом этапе.
+Добавлена оценка FGSM и PGD на validation. Защиты и финальная оценка holdout
+не реализуются на этом этапе.
 Данные и веса сторонних проектов не включены; исходный датасет пользователь
 получает у официального VisDrone с соблюдением условий использования.
 
@@ -542,3 +543,192 @@ fsync или транзакцию для всех файлов: сохранно
 Не запускайте параллельные resume одного RUN_DIR. Настоящие T4/Drive и сброс
 Colab следует проверить коротким запуском пользователя; разработка использует
 только синтетические CPU-тесты.
+
+## FGSM и PGD — validation, baseline v1 и отдельный Base v2
+
+Ветка реализации основана на согласованном commit
+`57395eefc0df3a0bb57b20ca7a918c2ac28d0cb7`. Код обучения, presets, архитектуры,
+checkpoints, индексы и прежние результаты не изменяются. Ни holdout, ни train JSON
+оценщик не открывает. Square/Patch, transferability и защиты не реализованы.
+
+### Пространство атак и предобработка
+
+1. `VisDroneCrops` читает PIL RGB crop по существующей рамке validation.json.
+2. Геометрия **точно из существующего evaluation-transform** timm: resize/center
+   crop, bicubic, затем преобразование в float32 RGB 224×224 в [0,1].
+3. FGSM/PGD меняет этот RGB-тензор; epsilon относится к его пиксельной шкале.
+4. `PixelModel` дифференцируемо вычисляет `(rgb - mean) / std`, затем классификатор.
+
+Из timm Compose удаляется ровно один последний Normalize. Если структура иная,
+код выдаёт ошибку вместо скрытой подмены. Сохранённый data_config сверяется с
+resolve_model_data_config и метаданными обучающего запуска. Ни тренировочных
+аугментаций, ни дополнительного resize/нормализации внутри атак нет.
+
+| Модель | Вход | crop_pct | mean/std |
+|---|---|---|---|
+| ConvNeXt-Base | 224×224 | 0.875 | ImageNet |
+| ConvNeXt-Nano | 224×224 | 0.95 | ImageNet |
+| TinyViT-5M | 224×224 | 0.95 | ImageNet |
+| ViT-B/16 | 224×224 | 0.9 | 0.5 / 0.5 |
+
+Общая размерность **не означает одинаковый геометрический вид объекта**: различные
+crop_pct могут удалять разную часть краёв вытянутых crop. Это сохраняет обученный
+preprocessing, но является фактором сравнения. Возмущение задаётся **после**
+геометрии, не на исходном снимке/рамке; 1/255 относится к float RGB, без повторной
+8-bit квантизации перед inference. Resize не восстанавливает детали малых целей.
+Предобучение (особенно distillation ImageNet-22k у TinyViT) также различается.
+
+### Единый протокол и API
+
+`attacks.core.generate(model, images, labels, AttackConfig(...))` — общий интерфейс.
+Модель должна принимать RGB (обычно через PixelModel), images — FP32 NCHW, labels —
+истинные int64 метки. Атаки нетаргетированные, с CrossEntropyLoss:
+
+- FGSM: один шаг alpha=epsilon, без random start.
+- PGD: 20 шагов alpha=epsilon/4, один uniform random start в [-epsilon,+epsilon]
+  с clipping в [0,1], проекция к **исходному** RGB после каждого шага, без рестартов.
+- CLI разрешает epsilon `0 1/255 2/255 4/255 8/255`. Ноль — контроль, возвращает
+  исходные пиксели без градиентных шагов; nominal параметры сохраняются с control=true.
+
+Linf и диапазон проверяются после каждого шага и независимо в оценщике.
+Численная погрешность Linf допускается до 1e-6, фактический Linf сохраняется.
+Атаки и clean inference выполняются FP32 без AMP; TF32 отключён и включены
+детерминированные алгоритмы через существующий seed_everything. Операции без
+детерминированной реализации могут вызвать явную ошибку. Это не обещание битовой
+идентичности разных GPU/драйверов/версий библиотек или batch size.
+
+`autograd.grad` запрашивает только градиент по RGB: optimizer не создаётся, веса,
+requires_grad и прежние parameter.grad не меняются. Для атаки временно включается
+eval; исходные training-флаги всех submodules восстанавливаются даже при ошибке.
+Случайный старт PGD имеет отдельный torch CPU Generator на объект, seed вычисляется
+из SHA-256([base_seed, sample_id]); он не зависит от модели/epsilon/порядка batch
+и не расходует глобальное RNG. Специально не выбирается лучший iterate по loss:
+оценивается последний из 20 шагов основного протокола.
+
+### Готовые команды будущего пилота Kaggle
+
+Из checkout проекта после установки `requirements.txt` задайте реальные пути
+к своим уже подключённым input datasets (имена ниже — примеры):
+
+```bash
+MODEL_RUN=/kaggle/input/visdrone-baselines/convnext_nano/RUN_NAME
+VISDRONE_ROOT=/kaggle/input/visdrone2019-det/VisDrone
+VALIDATION_INDEX=/kaggle/input/visdrone-data-v1/data-v1/validation.json
+ATTACK_OUTPUT=/kaggle/working/attack-results
+
+python -m attacks.evaluation --model-run "$MODEL_RUN" --checkpoint "$MODEL_RUN/best_weights.pt" --variant baseline-v1 --root "$VISDRONE_ROOT" --validation-index "$VALIDATION_INDEX" --output "$ATTACK_OUTPUT" --attack fgsm --epsilon 0 1/255 2/255 4/255 8/255 --subset-size 256 --seed 42 --batch-size 8 --device cuda --save-examples 4
+
+python -m attacks.evaluation --model-run "$MODEL_RUN" --checkpoint "$MODEL_RUN/best_weights.pt" --variant baseline-v1 --root "$VISDRONE_ROOT" --validation-index "$VALIDATION_INDEX" --output "$ATTACK_OUTPUT" --attack pgd --epsilon 0 1/255 2/255 4/255 8/255 --subset-size 256 --seed 42 --batch-size 8 --device cuda
+```
+
+Это команды для **ручного будущего пилота**, не запускаемые тестами. Можно выбрать
+512 вместо 256. Без --subset-size используется весь frozen validation; ожидаемые
+30 570 объектов предоставлены пользователем, здесь на реальном VisDrone не проверены.
+CLI одной командой последовательно оценивает один checkpoint на списке epsilon,
+создавая отдельный уникальный run для каждого значения. В памяти одна архитектура.
+Для остальных baseline измените MODEL_RUN на нужный запуск Nano/Base/TinyViT/ViT.
+
+Base v2 на 50 000 crop с lr=3e-5 запускайте с **--variant convnext-base-v2** и его
+собственным MODEL_RUN/checkpoint. Загрузчик не позволит пометить этот вариант как
+baseline-v1 или подменить им основной четырёхмодельный baseline. Variant сохраняется
+в конфигурации и каждой строке CSV. Smoke-trained checkpoints отклоняются.
+
+Для полного доверенного checkpoint замените параметры загрузки на:
+
+```text
+--checkpoint /path/to/best.pt --checkpoint-format full --trusted-full-checkpoint
+```
+
+Без явного флага доверия pickle/RNG из full checkpoint не загружается. Для compact
+используется существующий load_weights с weights_only=True и проверкой commit.json
+при его наличии. MODEL_RUN должен содержать согласованные config.json,
+preprocessing.json, data.json, provenance.json. При неполной публикации сначала
+исправьте/восстановите **свой обучающий запуск существующими средствами**, затем
+передайте его оценщику. Сам оценщик ничего в MODEL_RUN не пишет и не скачивает
+pretrained-веса; strict state_dict loading не оставляет случайной головы.
+
+### Идентификаторы, результаты и прерывание
+
+Выборка: sorted(random.Random(seed).sample(...)) позиций исходного validation.json.
+Никакого нового split или фильтра по размеру/классу; bbox и line сохраняются.
+sample_id = `index_sha256:original_zero_based_row:record_sha256`; он устойчив для
+того же frozen файла и связывает объект с изображением, рамкой, классом и строкой.
+Изменение байтов JSON меняет index hash и пространство идентификаторов. Хеш
+подмножества включает выбранные записи, их позиции и attack seeds.
+
+Новый `OUTPUT/<uuid>/` создаётся эксклюзивно; перезапись и resume атак отсутствуют.
+Запуски разных моделей/variant/checkpoint/epsilon не переиспользуются. OUTPUT
+должен находиться отдельно от изображений, индексов и model-run. Файлы:
+
+- `config.json`: параметры атаки/FP32, variant, полный model ID, checkpoint path/SHA,
+  training metadata, preprocessing, hash индекса и подмножества, размер batch,
+  seed, Git commit/status/diff hash, hashes кода attacks/, Python/torch/torchvision/
+  timm/CUDA. Несохранённый код дополнительно идентифицируется собственными hashes.
+- `subset.json`: выбранные позиции, sample_id, image, bbox, line, класс, attack_seed
+  и правило формирования. Ни один исходный индекс не записывается.
+- `predictions/batch-*.csv`: атомарные порции с идентичностью объекта/модели/весов,
+  true/clean/adversarial class, clean_correct, attack_success, epsilon, base/object
+  seed, параметрами атаки и фактическим Linf.
+- `metrics.json`: агрегаты для завершённых порций. Accuracy делится на **все**
+  объекты. ASR — только на clean-correct; при нулевом знаменателе JSON null и
+  asr_defined=false. В CSV attack_success пуст для изначально ошибочных объектов.
+  Macro-F1 и per-class F1 используют все 10 классов, нулевой знаменатель F1 → 0
+  по существующему ClassificationMetrics. Есть clean_correct_per_class и F1 drop.
+- `status.json`: running/completed/failed, число записанных объектов, UTC начало/
+  завершение, причина ошибки. `diagnostics.jsonl`: нулевые/нечисловые градиенты,
+  нечисловые logits/loss с batch/sample IDs. Nonfinite останавливает запуск.
+- Опционально `examples/` (0 по умолчанию, максимум 16): clean/adv RGB PNG и signed
+  FP32 `*-delta.pt` (читается weights_only=True), JSON sample_id/epsilon. PNG только
+  визуализация с 8-bit округлением; точное delta сохранено тензором. Все изображения
+  не сохраняются.
+
+Порция CSV сначала записывается во временный файл и атомарно публикуется, затем
+обновляются metrics/status. При обрыве возможен отстающий metrics.json, но уже
+опубликованные CSV остаются пригодны для анализа. SIGKILL может оставить .tmp,
+который читатель не рассматривает как порцию. Повторный запуск всегда новый uuid;
+автоматического продолжения/дублирования строк в прежнем run нет. Пример чтения:
+
+```python
+from pathlib import Path
+from attacks.results import read_predictions, summarize
+run = Path('/kaggle/working/attack-results/RUN_UUID')
+rows = read_predictions(run)  # Проверка модели/checkpoint/epsilon и уникальности ID.
+metrics = summarize(rows)    # Истина для опубликованного префикса при прерывании.
+```
+
+Результаты частичного подмножества должны быть явно обозначены как partial,
+не смешивайте их с complete. Файловая атомарность не гарантирует fsync/сохранность
+временного Kaggle-диска после уничтожения runtime; для длительного хранения
+пользователь отдельно сохраняет новый каталог результатов. Никакой автоматической
+публикации в checkpoint datasets или изменения старых экспериментальных файлов нет.
+
+### Проверки и ограничения до массового запуска
+
+CPU-тесты проверяют аналитический знак FGSM/рост CE, каждый шаг проекции PGD,
+число итераций и реальное изменение iterate, RNG, веса/градиенты/режим модели,
+нормализацию всех четырёх timm configurations без двойного применения и градиент
+до RGB, точные метрики/нулевой ASR-знаменатель, строки/агрегаты, загрузку strict
+compact/full без pretrained, уникальность run и сохранение префикса после сбоя.
+Синтетический CLI smoke покрывает несколько epsilon и основной 20-step PGD.
+
+Перед реальным пилотом проверьте пути/идентичность четырёх baseline и отдельного
+Base v2, training provenance, число validation-объектов, визуальную геометрию crop,
+совпадение epsilon=0 с обычным inference, ненулевые конечные градиенты всех четырёх
+реальных обученных моделей, T4/Kaggle память/скорость и достаточность выбранного
+batch. Для сравнения сохраняйте одинаковые выбранные sample IDs и base seed.
+В unit-тестах реальные обученные веса/VisDrone не использовались; инференс с
+настоящими checkpoint и атаки на GPU здесь не выполнялись. Хеши исходных изображений
+не считаются: неизменность image datasets необходимо обеспечить отдельно.
+
+PGD-20 с одним стартом не доказывает отсутствие более сильных атак. PGD не обязана
+превосходить FGSM на каждой отдельной выборке, как и рост loss не доказывает ASR:
+успех определяется только ошибкой на изначально верно распознанном объекте.
+Не выбирайте бюджеты/защиты на holdout; он остаётся закрытым. Этот этап завершается
+FGSM/PGD validation-инфраструктурой, без автоматического перехода к будущим атакам.
+
+Проверка этой реализации в Codex: `python -m pytest -q` — **92 passed, 1 skipped**
+(CUDA недоступна), одно существующее предупреждение torch.jit.interface.
+Отдельный CPU smoke: шесть синтетических crop, FGSM eps=0/4/255 и PGD-20 eps=4/255;
+все три запуска completed, max Linf для ненулевого epsilon = 0.0156862735748291
+при бюджете 4/255 = 0.01568627450980392. Это проверка конвейера, не результат
+устойчивости обученных VisDrone-моделей. `git diff --check` и проверка CLI пройдены.
