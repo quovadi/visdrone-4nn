@@ -9,7 +9,7 @@ from training.data import load_records
 from training.storage import check_separate
 from training.consistency import file_digest
 from training.checkpoint import write_json
-from attacks.patch_io import new_run, finish
+from attacks.patch_io import new_run, finish, verify
 
 IDENTITY_FIELDS = ('sample_id', 'index_row', 'image', 'box', 'label', 'line')
 
@@ -89,7 +89,11 @@ def prepare_subset(index, output, size=1024, seed=42, square_subset=None):
 
 
 def read_subset(index, subset):
-    saved = json.loads(Path(subset).read_text())
+    subset = Path(subset).resolve()
+    if subset.name != 'subset.json':
+        raise ValueError('Expected Stage 5 subset.json artifact location')
+    verify(subset.parent, 'subsets')
+    saved = json.loads(subset.read_text())
     records, current = validation_population(index, saved['seed'])
     if saved['index_sha256'] != current['index_sha256'] or canonical_hash(saved['objects']) != saved['subset_sha256']:
         raise ValueError('Frozen Stage 5 subset/index checksum mismatch')

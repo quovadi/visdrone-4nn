@@ -2,10 +2,11 @@
 import json
 from pathlib import Path
 import numpy as np
-from attacks.adversarial_patch import AREAS, MODELS
+from attacks.adversarial_patch import AREAS, MODELS, PatchConfig
 from attacks.patch_evaluation import read_evaluation
 from attacks.patch_training import load_patch
-from attacks.patch_io import new_run, finish, write_csv
+from attacks.patch_io import new_run, finish, write_csv, verify
+from attacks.data import canonical_hash
 from training.checkpoint import atomic_save, write_json
 from training.consistency import file_digest
 from training.storage import check_separate
@@ -48,12 +49,56 @@ def transfer_matrices(evaluations, allow_partial=False):
         records.append({'synthetic':config['target'].get('synthetic',False),'source':source,'target':target,'area_fraction':area,
                         **{k:metrics[k] for k in ('asr','clean_accuracy','adversarial_accuracy','adversarial_macro_f1')},
                         'run':str(Path(run).resolve()),'patch_sha256':config['patch_sha256']})
-    if not seen or (not allow_partial and len(seen) != 48):
+    expected = {(source, target, area) for source in MODELS for target in MODELS for area in AREAS}
+    if not seen or (not allow_partial and seen != expected):
         raise ValueError('Full report requires 48 unique combinations; explicitly allow a partial pilot')
     for name in source_sha.keys() & target_sha.keys():
         if source_sha[name] != target_sha[name]:
             raise ValueError('Source/target baseline checkpoint mismatch on diagonal')
     return matrices, records
+
+
+
+def validate_patch_protocol(paths, allow_partial=False):
+    """Validate published bundles and their common train-only research protocol."""
+    expected = {(model, area) for model in MODELS for area in AREAS}
+    patches, metadata, common = {}, {}, None
+    for path in paths:
+        path = Path(path)
+        config = verify(path, 'patches')
+        patch, meta = load_patch(path)
+        selection = json.loads((path / 'train_subset.json').read_text())
+        objects = selection['objects']
+        subset_sha = canonical_hash(objects)
+        if (subset_sha != selection['subset_sha256']
+                or subset_sha != config['train_selection_sha256']
+                or subset_sha != meta['train_subset_sha256']
+                or selection['index_sha256'] != meta['train_index_sha256']
+                or type(selection['size']) is not int or selection['size'] != len(objects)
+                or not objects or len({o['sample_id'] for o in objects}) != len(objects)
+                or any(not o['image'].startswith('VisDrone2019-DET-train/images/') for o in objects)):
+            raise ValueError('Patch training provenance mismatch')
+        optimization = config['optimization']
+        # Bind all recorded protocol fields, including fixed objective/rendering settings.
+        normalized = PatchConfig(**{k:optimization[k] for k in
+            ('area_fraction','steps','batch_size','lr','optimizer','seed','initialization')}).to_dict()
+        if (optimization != normalized or meta['optimization'] != optimization
+                or meta['seed'] != optimization['seed']
+                or meta['native_resolution'] != optimization['native_resolution']):
+            raise ValueError('Patch optimization metadata/config mismatch')
+        key = (meta['source_model'], meta['area_fraction'])
+        if key not in expected or key in patches:
+            raise ValueError('Unexpected or duplicate source patch in report')
+        identity = (selection['index_sha256'], subset_sha, canonical_hash(objects),
+                    selection['size'], selection['seed'],
+                    canonical_hash({k:v for k,v in optimization.items() if k != 'area_fraction'}))
+        if common is not None and identity != common:
+            raise ValueError('Patches use different training provenance or optimization protocol')
+        common = identity
+        patches[key], metadata[key] = patch, meta
+    if not patches or (not allow_partial and set(patches) != expected):
+        raise ValueError('Full report requires exactly 12 supported source-area patches')
+    return patches, metadata
 
 
 def render_report(run, matrices, records, patches):
@@ -111,20 +156,13 @@ def report(evaluations, output, *, patch_runs=None, allow_partial=False, plots=T
         check_separate(Path(output)/'reports',value)
     matrices, records = transfer_matrices(evaluations, allow_partial)
     paths = patch_runs or sorted({json.loads((Path(r) / 'config.json').read_text())['source_patch_run'] for r in evaluations})
-    patches, patch_hashes = {}, {}
     for path in paths:
         check_separate(Path(output)/'reports',path)
-        patch, meta = load_patch(path)
-        key = (meta['source_model'],meta['area_fraction'])
-        if key in patches:
-            raise ValueError('Duplicate source patch in report')
-        patches[key] = patch
-        patch_hashes[key] = meta['patch_sha256']
+    patches, patch_metadata = validate_patch_protocol(paths, allow_partial)
     for r in records:
-        if patch_hashes.get((r['source'],r['area_fraction'])) != r['patch_sha256']:
+        meta = patch_metadata.get((r['source'],r['area_fraction']))
+        if meta is None or meta['patch_sha256'] != r['patch_sha256']:
             raise ValueError('Report patch tensor does not match evaluation')
-    if not allow_partial and len(patches) != 12:
-        raise ValueError('Full report requires 12 unique patches')
     run = new_run(output,'reports',{'evaluation_runs':[str(Path(p).resolve()) for p in evaluations],
         'input_manifest_sha256':{str(Path(p).resolve()):file_digest(Path(p)/'run_manifest.json') for p in evaluations},
         'partial':allow_partial, 'synthetic':any(r['synthetic'] for r in records),

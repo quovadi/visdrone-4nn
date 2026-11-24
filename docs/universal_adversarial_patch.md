@@ -232,3 +232,22 @@ PNG was visually inspected and explicitly labels synthetic data/missing cells.
 CLI help, source compilation and git diff --check passed. All pre-existing tests
 and source files remain unchanged. These are synthetic software checks, not
 training or robustness measurements of the four trained VisDrone baselines.
+
+## Integrity and protocol checks before reporting
+
+Evaluation accepts only `subset.json` from a completed Stage 5 subset bundle:
+its parent `run_manifest.json` is verified before reading selection contents.
+Keep the complete bundle when moving it to Kaggle. Loose JSON files, incomplete
+bundles and edits inconsistent with the published manifest are rejected; no
+artifact is repaired or regenerated automatically. SHA-256 manifests detect
+changes against the published manifest, not an adversary rewriting both files
+and manifest.
+
+Reports validate every supplied patch bundle, including partial pilots. Training
+objects (including order), index/subset hashes, size and selection seed must
+agree. Config, metadata and train subset identities must agree internally. All
+optimization fields must match across patches except `area_fraction`; source
+architectures/checkpoint hashes may differ. Full reports require exactly the
+four supported sources times three supported areas and all 48 evaluation cells.
+Inconsistent older bundles are rejected rather than rewritten. The CLI and
+artifact layout are unchanged.

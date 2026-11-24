@@ -298,3 +298,122 @@ def test_validation_cannot_enter_optimizer_and_backup_failure_is_detected(tmp_pa
     assert original=={p:p.read_bytes() for p in run.rglob('*') if p.is_file()}
     with pytest.raises(ValueError,match='separate'):
         backup_bundle(run,run/'backup')
+
+
+@pytest.mark.parametrize('damage', ['edited', 'missing', 'incomplete', 'foreign', 'outside'])
+def test_frozen_subset_requires_published_manifest(tmp_path, damage):
+    from attacks.data import canonical_hash
+    root, indices, model, cfg, info = fixture(tmp_path)
+    subset = prepare_subset(indices/'validation.json', tmp_path/'stage5', size=6)
+    assert len(read_subset(indices/'validation.json', subset)[0]) == 6
+    if damage == 'edited':
+        saved = json.loads(subset.read_text())
+        saved['objects'].reverse()
+        saved['subset_sha256'] = canonical_hash(saved['objects'])
+        subset.write_text(json.dumps(saved))
+    elif damage == 'missing':
+        (subset.parent/'run_manifest.json').unlink()
+    elif damage == 'incomplete':
+        (subset.parent/'status.json').write_text('{"state":"failed"}')
+    elif damage == 'foreign':
+        config = json.loads((subset.parent/'config.json').read_text())
+        config['kind'] = 'patches'
+        (subset.parent/'config.json').write_text(json.dumps(config))
+        finish(subset.parent)
+    else:
+        outside = tmp_path/'subset.json'
+        outside.write_bytes(subset.read_bytes())
+        subset = outside
+    with pytest.raises((ValueError, FileNotFoundError)):
+        read_subset(indices/'validation.json', subset)
+
+
+def matrix_patch_fixtures(tmp_path):
+    """Published synthetic bundles, not twelve real optimization experiments."""
+    import shutil
+    import uuid
+    from attacks.adversarial_patch import patch_side
+    _, _, _, _, _, template = train_fixture(tmp_path)
+    runs = []
+    for model in MODELS:
+        for area in AREAS:
+            run = template.parent/uuid.uuid4().hex
+            shutil.copytree(template, run)
+            config = json.loads((run/'config.json').read_text())
+            meta = json.loads((run/'metadata.json').read_text())
+            config['run_id'] = run.name
+            config['source']['model'] = model
+            config['source']['checkpoint_sha256'] = model+'-synthetic-sha'
+            config['optimization']['area_fraction'] = area
+            meta.update(source_model=model, source_checkpoint_sha256=model+'-synthetic-sha',
+                        area_fraction=area, patch_side=patch_side(area),
+                        optimization=config['optimization'])
+            torch.save(torch.full((3,patch_side(area),patch_side(area)), .5), run/'patch.pt')
+            meta['patch_sha256'] = file_digest(run/'patch.pt')
+            (run/'config.json').write_text(json.dumps(config))
+            (run/'metadata.json').write_text(json.dumps(meta))
+            finish(run)
+            runs.append(run)
+    return runs
+
+
+def test_complete_patch_protocol_and_partial_are_accepted(tmp_path):
+    from attacks.patch_report import validate_patch_protocol
+    runs = matrix_patch_fixtures(tmp_path)
+    patches, metadata = validate_patch_protocol(runs)
+    assert set(patches) == {(m,a) for m in MODELS for a in AREAS}
+    assert len({m['source_checkpoint_sha256'] for m in metadata.values()}) == 4
+    assert len(validate_patch_protocol(runs[:2], True)[0]) == 2
+    with pytest.raises(ValueError, match='12'):
+        validate_patch_protocol(runs[:-1])
+    with pytest.raises(ValueError, match='duplicate'):
+        validate_patch_protocol(runs+[runs[0]])
+
+
+@pytest.mark.parametrize('field', ['index', 'subset', 'objects', 'selection_seed', 'size',
+    'lr', 'steps', 'batch_size', 'optimizer', 'initialization', 'seed',
+    'objective', 'precision', 'compositing', 'native_resolution', 'rotation', 'random_scaling',
+    'config_binding', 'metadata_binding', 'manifest'])
+def test_patch_protocol_rejects_mixed_or_internally_invalid_bundles(tmp_path, field):
+    from attacks.patch_report import validate_patch_protocol
+    from attacks.data import canonical_hash
+    runs = matrix_patch_fixtures(tmp_path)
+    run = runs[-1]
+    config = json.loads((run/'config.json').read_text())
+    meta = json.loads((run/'metadata.json').read_text())
+    selection = json.loads((run/'train_subset.json').read_text())
+    if field == 'index':
+        selection['index_sha256'] = meta['train_index_sha256'] = 'foreign-index'
+    elif field in ('subset', 'objects'):
+        if field == 'subset':
+            selection['objects'].reverse()
+        else:
+            selection['objects'][0]['sample_id'] = 'foreign-object'
+        sha = canonical_hash(selection['objects'])
+        selection['subset_sha256'] = config['train_selection_sha256'] = meta['train_subset_sha256'] = sha
+    elif field == 'selection_seed':
+        selection['seed'] += 1
+    elif field == 'size':
+        selection['size'] += 1
+    elif field == 'config_binding':
+        config['train_selection_sha256'] = 'foreign'
+    elif field == 'metadata_binding':
+        meta['train_subset_sha256'] = 'foreign'
+    elif field != 'manifest':
+        alternatives = {'lr': .123, 'steps': 99, 'batch_size': 99, 'optimizer': 'sgd',
+            'initialization':'uniform', 'seed': 99, 'objective':'other', 'precision':'fp16',
+            'compositing':'blend', 'native_resolution':[32,32], 'rotation':True, 'random_scaling':True}
+        config['optimization'][field] = alternatives[field]
+        meta['optimization'] = config['optimization']
+        if field == 'seed':
+            meta['seed'] = alternatives[field]
+    (run/'config.json').write_text(json.dumps(config))
+    (run/'metadata.json').write_text(json.dumps(meta))
+    (run/'train_subset.json').write_text(json.dumps(selection))
+    if field != 'manifest':
+        finish(run)  # Exercise semantic consistency even with refreshed local digests.
+    else:
+        (run/'train_subset.json').write_text('{}')
+    for partial in (False, True):
+        with pytest.raises(ValueError):
+            validate_patch_protocol(runs, partial)
