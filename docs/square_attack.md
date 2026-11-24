@@ -173,3 +173,12 @@ Separate CPU smoke completed on four generated crops: 25 total queries, three
 clean-correct objects at the 8-query cap and one clean error at one query. No
 trained VisDrone scores or real validation results were measured. The Square CLI
 help and all existing FGSM/PGD integrity/regression tests passed.
+
+## Exact query trajectories (new runs)
+
+New linked query records include an observed `first_success_query` (null for
+clean errors/failures). See [trajectory analysis and legacy migration](square_trajectories.md)
+for the strict schema, constant-denominator single-run ASR curve, CSV/PNG/PDF
+postprocessing and explicit `allow_legacy=True` reading of historical artifacts.
+Historical indices are never guessed or added to old files. Plotting is a separate
+optional process and cannot change completed attack status.

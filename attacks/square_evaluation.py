@@ -105,6 +105,7 @@ def evaluate_square(model, data, selection, model_info, data_config, attack, out
                         'linf': float(linf[i])})
                 query_chunk = [{'sample_id': identity['sample_id'], 'run_id': run.name,
                     'checkpoint_sha256': model_info['checkpoint_sha256'],
+                    'first_success_query': result['first_success_query'][i],
                     'queries': int(result['queries'][i]), 'success': bool(result['success'][i]),
                     'clean_correct': bool(clean[i] == labels[i]),
                     'final_prediction': int(predictions[i]), 'linf': float(linf[i]),

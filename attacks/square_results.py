@@ -1,6 +1,7 @@
 """Square query records supplement the unchanged paired-prediction schema."""
 import json
 import math
+import warnings
 from pathlib import Path
 from attacks.results import read_predictions
 
@@ -18,7 +19,7 @@ def query_summary(records):
             'successful_samples': sum(r['success'] for r in records)}
 
 
-def read_square_predictions(run, *, allow_stale_partial=False):
+def read_square_predictions(run, *, allow_stale_partial=False, allow_legacy=False):
     run = Path(run)
     rows = read_predictions(run, allow_stale_partial=allow_stale_partial)
     config = json.loads((run / 'config.json').read_text())
@@ -54,8 +55,24 @@ def read_square_predictions(run, *, allow_stale_partial=False):
                 or (not row['clean_correct'] and (reason != 'clean_incorrect' or q != 1))
                 or (row['epsilon'] == 0 and row['clean_correct'] and (reason != 'epsilon_zero' or q != 1))):
             raise ValueError('Square stop reason/query inconsistency')
+        recorded = 'first_success_query' in record
+        if not recorded:
+            if not allow_legacy:
+                raise ValueError('Legacy Square artifact lacks first_success_query; use allow_legacy=True explicitly')
+        else:
+            first = record['first_success_query']
+            if record['success']:
+                if (not row['clean_correct'] or type(first) is not int or not 1 < first <= q
+                        or first != q or reason != 'success' or row['epsilon'] == 0):
+                    raise ValueError('Invalid first_success_query or immediate-stop consistency')
+            elif first is not None:
+                raise ValueError('Unsuccessful/clean-incorrect sample must have null first_success_query')
         row.update(record)
+        row['first_success_query'] = record.get('first_success_query')
+        row['first_success_query_recorded'] = recorded
     path = run / 'query_metrics.json'
     if status['state'] == 'completed' and (not path.exists() or json.loads(path.read_text()) != query_summary(records)):
         raise ValueError('Square aggregate query metrics mismatch')
+    if any(not row['first_success_query_recorded'] for row in rows):
+        warnings.warn('Legacy Square data: exact first-success queries are unknown; no trajectory inference', RuntimeWarning)
     return rows
