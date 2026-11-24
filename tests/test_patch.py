@@ -300,7 +300,7 @@ def test_validation_cannot_enter_optimizer_and_backup_failure_is_detected(tmp_pa
         backup_bundle(run,run/'backup')
 
 
-@pytest.mark.parametrize('damage', ['edited', 'missing', 'incomplete', 'foreign', 'outside'])
+@pytest.mark.parametrize('damage', ['edited', 'missing', 'incomplete', 'foreign', 'outside', 'moved_bundle', 'renamed_bundle'])
 def test_frozen_subset_requires_published_manifest(tmp_path, damage):
     from attacks.data import canonical_hash
     root, indices, model, cfg, info = fixture(tmp_path)
@@ -320,10 +320,19 @@ def test_frozen_subset_requires_published_manifest(tmp_path, damage):
         config['kind'] = 'patches'
         (subset.parent/'config.json').write_text(json.dumps(config))
         finish(subset.parent)
-    else:
+    elif damage == 'outside':
         outside = tmp_path/'subset.json'
         outside.write_bytes(subset.read_bytes())
         subset = outside
+    elif damage == 'moved_bundle':
+        import shutil
+        moved = tmp_path/'moved_bundle'
+        shutil.move(str(subset.parent), moved)
+        subset = moved/'subset.json'
+    elif damage == 'renamed_bundle':
+        renamed = subset.parent.parent/'renamed-bundle'
+        subset.parent.rename(renamed)
+        subset = renamed/'subset.json'
     with pytest.raises((ValueError, FileNotFoundError)):
         read_subset(indices/'validation.json', subset)
 
