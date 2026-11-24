@@ -93,6 +93,8 @@ def generate_square(scores, images, labels, config, *, sample_seeds=None, diagno
     queries = torch.zeros(n, dtype=torch.int64, device=images.device)
     accepted = [0]*n
     reasons = ['budget']*n
+    first_success = [None]*n
+    clean_correct = None
 
     def query(indices, batch, stage):
         queries[indices] += 1
@@ -105,10 +107,20 @@ def generate_square(scores, images, labels, config, *, sample_seeds=None, diagno
             raise ValueError('Score oracle must return finite FP32 [N,classes] logits')
         if torch.any(labels[indices] < 0) or torch.any(labels[indices] >= logits.shape[1]):
             raise ValueError('Labels outside oracle classes')
-        return logits.argmax(1), margin(logits, labels[indices])
+        predictions = logits.argmax(1)
+        if clean_correct is not None:
+            misclassified = indices[clean_correct[indices] & (predictions != labels[indices])]
+            for i in misclassified.tolist():
+                if first_success[i] is None:
+                    first_success[i] = int(queries[i])
+                    if diagnostic:
+                        diagnostic({'kind': 'square_first_success', 'positions': [i],
+                                    'first_success_query': first_success[i]})
+        return predictions, margin(logits, labels[indices])
 
     ids = torch.arange(n, device=images.device)
     clean, best_margin = query(ids, images, 'clean')
+    clean_correct = clean == labels
     prediction = clean.clone()
     best = images.detach().clone()
     active = clean == labels
@@ -165,4 +177,4 @@ def generate_square(scores, images, labels, config, *, sample_seeds=None, diagno
     distances = check_bounds(images, best, config.epsilon)
     return {'images': best, 'clean_prediction': clean, 'prediction': prediction,
             'queries': queries, 'linf': distances, 'success': successes,
-            'margin': best_margin, 'accepted_updates': accepted, 'stop_reason': reasons}
+            'first_success_query': first_success, 'margin': best_margin, 'accepted_updates': accepted, 'stop_reason': reasons}
