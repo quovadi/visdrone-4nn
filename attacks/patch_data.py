@@ -92,7 +92,9 @@ def read_subset(index, subset):
     subset = Path(subset).resolve()
     if subset.name != 'subset.json':
         raise ValueError('Expected Stage 5 subset.json artifact location')
-    verify(subset.parent, 'subsets')
+    bundle = verify(subset.parent, 'subsets')
+    if subset.parent.name != bundle['run_id'] or subset.parent.parent.name != 'subsets':
+        raise ValueError('Frozen Stage 5 subset must remain in its published subsets/<run_id> bundle')
     saved = json.loads(subset.read_text())
     records, current = validation_population(index, saved['seed'])
     if saved['index_sha256'] != current['index_sha256'] or canonical_hash(saved['objects']) != saved['subset_sha256']:
