@@ -1,6 +1,9 @@
 name: Stage 5 CPU validation
 
 on:
+  push:
+    branches:
+      - feature/universal-adversarial-patch
   pull_request:
     branches:
       - feature/square-query-trajectories
