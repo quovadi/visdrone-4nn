@@ -1,0 +1,65 @@
+name: Stage 5 CPU validation
+
+on:
+  push:
+    branches:
+      - feature/universal-adversarial-patch
+  pull_request:
+    branches:
+      - feature/square-query-trajectories
+    paths:
+      - "attacks/**"
+      - "data/**"
+      - "training/**"
+      - "tests/**"
+      - "requirements.txt"
+      - ".github/workflows/stage5-ci.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stage5-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cpu-validation:
+    name: Full tests and synthetic Stage 5 smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      MPLCONFIGDIR: ${{ runner.temp }}/mpl
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install CPU PyTorch and project requirements
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu "torch>=2.4,<3" "torchvision>=0.19,<1"
+          python -m pip install -r requirements.txt
+
+      - name: Compile project modules
+        run: python -m compileall -q attacks data training tests
+
+      - name: Run complete test suite
+        run: python -m pytest -q
+
+      - name: Run synthetic Stage 5 end-to-end smoke
+        run: python -m attacks.patch_smoke --output "${{ runner.temp }}/stage5-smoke"
+
+      - name: Check patch whitespace
+        run: |
+          git fetch origin "${{ github.base_ref }}"
+          git diff --check "origin/${{ github.base_ref }}...HEAD"
